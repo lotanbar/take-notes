@@ -693,7 +693,28 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       if (!nodeKey) return;
       payload = await encryptToB64(nodeKey, payload);
     }
-    const contentRef = await appendVaultBlob(filePath, payload);
+    // The vault file lives under external sync tools (e.g. Google Drive) that
+    // can touch/re-upload it mid-write. Read back what actually landed on disk
+    // and confirm it decrypts before trusting the pointer — catches a
+    // sync-induced bit-flip/truncation right here instead of silently wiring
+    // this note's contentRef to bytes that will fail decryption forever after.
+    let contentRef = await appendVaultBlob(filePath, payload);
+    const readBack = await readVaultBlob(filePath, contentRef);
+    if (readBack !== payload) {
+      // One retry: the collision is almost always a one-off timing hit, not a
+      // persistent fault, so a second attempt costs little and usually clears it.
+      contentRef = await appendVaultBlob(filePath, payload);
+      const readBack2 = await readVaultBlob(filePath, contentRef);
+      if (readBack2 !== payload) {
+        const message =
+          `Couldn't save "${node.name}": the vault file was corrupted on disk while writing (readback mismatch ` +
+          "after retry), most likely a sync tool (Google Drive) touching the file mid-write. Nothing was lost in " +
+          "the note you're editing — the save was aborted rather than committing a broken pointer. Try again in a " +
+          "moment once syncing settles.";
+        set({ error: message });
+        throw new Error(message);
+      }
+    }
     // Re-read current state instead of the pre-await snapshot: other async
     // actions (another note's save, a lock/unlock) may have committed their
     // own tree updates while this appendVaultBlob call was queued behind
