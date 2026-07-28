@@ -12,6 +12,10 @@ function nodeSessionsKey(vaultPath: string): string {
   return `vault-notes:nodeSessions:${vaultPath}`;
 }
 
+function layoutKey(vaultPath: string): string {
+  return `vault-notes:layout:${vaultPath}`;
+}
+
 interface StoredSession {
   keyB64: string;
 }
@@ -65,4 +69,21 @@ export function clearNodeSession(vaultPath: string, nodeId: string): void {
   const sessions = loadNodeSessions(vaultPath);
   delete sessions[nodeId];
   localStorage.setItem(nodeSessionsKey(vaultPath), JSON.stringify(sessions));
+}
+
+// Remembers the open tabs / split layout across app relaunches (and across
+// lock/unlock), keyed by vault path same as the other session state above.
+// The stored value is dockview's own serialized layout shape — opaque here.
+export function loadLayout(vaultPath: string): unknown | null {
+  const raw = localStorage.getItem(layoutKey(vaultPath));
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export function saveLayout(vaultPath: string, layout: unknown): void {
+  localStorage.setItem(layoutKey(vaultPath), JSON.stringify(layout));
 }

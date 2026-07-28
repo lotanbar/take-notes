@@ -36,8 +36,8 @@ const LIGHT_COLORS: ThemeColors = {
 };
 
 const DARK_COLORS: ThemeColors = {
-  bg1: "#1c1c1f",
-  bg2: "#38383e",
+  bg1: "#141416",
+  bg2: "#2c2c32",
   border: "#4a4a52",
   text0: "#ffffff",
   text2: "#9a9aa3",

@@ -2,15 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import type { DragEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import {
-  Bookmark as BookmarkIcon,
-  Link2,
-  ArrowLeft,
-  ArrowRight,
-  Trash2,
-  UploadCloud,
-} from "lucide-react";
+import { Link2, Trash2, UploadCloud } from "lucide-react";
 import { monaco, registerIndentCarryingEnter, currentThemeName, watchThemeChanges } from "../editor/monacoSetup";
+import {
+  acquireNoteModel,
+  releaseNoteModel,
+  flushSaveNow,
+  setBookmarkDecorations,
+  setLinkDecorations,
+  getDecorationRanges,
+  type NoteModelState,
+} from "../editor/noteModel";
 import { useVaultStore } from "../store/vaultStore";
 import { useZoomStore } from "../store/zoomStore";
 import { isLinkBroken } from "../lib/bookmarkOps";
@@ -22,14 +24,13 @@ import {
   unregisterAttachmentUpdateHandler,
 } from "../lib/attachmentWatch";
 import { detectDirection } from "../lib/textDirection";
-import type { Attachment, NodeContent } from "../types/vault";
+import type { Attachment } from "../types/vault";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { NewBookmarkPopup } from "./NewBookmarkPopup";
 import { BookmarkPickerPopup } from "./BookmarkPickerPopup";
 import { ReferrersPopup } from "./ReferrersPopup";
 import { AttachmentRow } from "./AttachmentRow";
 
-const SAVE_DEBOUNCE_MS = 500;
 const BASE_FONT_SIZE = 12;
 const STICKINESS = monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges;
 
@@ -60,17 +61,6 @@ function computeMarkMode(
   return { mode: "create" };
 }
 
-interface BookmarkMeta {
-  bookmarkId: string;
-  label: string;
-}
-
-interface LinkMeta {
-  linkId: string;
-  targetBookmarkId: string;
-  broken: boolean;
-}
-
 interface ToolbarState {
   bookmarkMode: MarkMode;
   bookmarkRemoveId?: string;
@@ -78,44 +68,29 @@ interface ToolbarState {
   linkRemoveId?: string;
 }
 
-const EMPTY_CONTENT: NodeContent = { text: "", bookmarks: [], links: [], attachments: [] };
-
 export function Editor({ fileId, fileName }: EditorProps) {
   const loadNodeContent = useVaultStore((s) => s.loadNodeContent);
-  const runExclusive = useVaultStore((s) => s.runExclusive);
-  const saveNodeContentRaw = useVaultStore((s) => s.saveNodeContentRaw);
   const addBookmarkToIndex = useVaultStore((s) => s.addBookmarkToIndex);
   const removeBookmarkFromIndex = useVaultStore((s) => s.removeBookmarkFromIndex);
   const addReferrerToIndex = useVaultStore((s) => s.addReferrerToIndex);
   const removeReferrerFromIndex = useVaultStore((s) => s.removeReferrerFromIndex);
   const activeBookmarkId = useVaultStore((s) => s.activeBookmarkId);
-  const navBack = useVaultStore((s) => s.navBack);
-  const navForward = useVaultStore((s) => s.navForward);
-  const goBack = useVaultStore((s) => s.goBack);
-  const goForward = useVaultStore((s) => s.goForward);
   const uiZoom = useZoomStore((s) => s.uiZoom);
   const editorZoom = useZoomStore((s) => s.editorZoom);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
-  const bookmarkDecosRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
-  const linkDecosRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
+  const noteStateRef = useRef<NoteModelState | null>(null);
   const rtlLineDecosRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
-  const bookmarkMetaRef = useRef<BookmarkMeta[]>([]);
-  const linkMetaRef = useRef<LinkMeta[]>([]);
-  const latestContentRef = useRef<NodeContent>(EMPTY_CONTENT);
-  const latestAttachments = useRef<Attachment[]>([]);
-  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragCounter = useRef(0);
   const rejectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const loadedRef = useRef(false);
   const mountedRef = useRef(true);
-  const editedBeforeLoadRef = useRef(false);
-  const prevBookmarkWidthsRef = useRef<Map<string, number>>(new Map());
-  const skipBookmarkCheckRef = useRef(false);
+  // Bookmark/link mode is now only read by the Ctrl+B/Ctrl+L keyboard shortcuts
+  // (see the mount effect), not rendered — a ref avoids a re-render on every
+  // cursor move.
+  const toolbarStateRef = useRef<ToolbarState | null>(null);
 
   const [editorReady, setEditorReady] = useState(false);
-  const [toolbarState, setToolbarState] = useState<ToolbarState | null>(null);
   const [showNewBookmarkPopup, setShowNewBookmarkPopup] = useState(false);
   const [showLinkPicker, setShowLinkPicker] = useState(false);
   const [pendingBookmarkDeletion, setPendingBookmarkDeletion] = useState<PendingBookmarkDeletion | null>(null);
@@ -125,47 +100,36 @@ export function Editor({ fileId, fileName }: EditorProps) {
   const [pendingDeleteAttachment, setPendingDeleteAttachment] = useState<Attachment | null>(null);
   const [rejectedNames, setRejectedNames] = useState<string[]>([]);
 
-  function flushSave() {
-    if (!loadedRef.current) return;
-    // Read the refs lazily, inside the work callback, rather than building the
-    // content object here: if this ends up queued behind another pending save
-    // for this note (see runExclusive in vaultStore.ts), building it eagerly
-    // would capture a stale snapshot instead of whatever those refs hold by
-    // the time this actually gets to run.
-    runExclusive(fileId, () =>
-      saveNodeContentRaw(fileId, { ...latestContentRef.current, attachments: latestAttachments.current }),
-    );
-  }
-
   function refreshToolbarState() {
     const editor = editorRef.current;
+    const noteState = noteStateRef.current;
     const model = editor?.getModel();
-    if (!editor || !model) return;
+    if (!editor || !model || !noteState) return;
     const selection = editor.getSelection();
     const hasSelection = !!selection && !selection.isEmpty();
     const selFrom = selection ? model.getOffsetAt(selection.getStartPosition()) : 0;
     const selTo = selection ? model.getOffsetAt(selection.getEndPosition()) : 0;
 
-    const bookmarkRanges = (bookmarkDecosRef.current?.getRanges() ?? []).map((r, i) => ({
-      id: bookmarkMetaRef.current[i]?.bookmarkId,
-      from: model.getOffsetAt(r.getStartPosition()),
-      to: model.getOffsetAt(r.getEndPosition()),
+    const bookmarkRanges = getDecorationRanges(model, noteState.bookmarkDecoIds).map((r, i) => ({
+      id: noteState.bookmarkMeta[i]?.bookmarkId,
+      from: r ? model.getOffsetAt(r.getStartPosition()) : 0,
+      to: r ? model.getOffsetAt(r.getEndPosition()) : 0,
     }));
-    const linkRanges = (linkDecosRef.current?.getRanges() ?? []).map((r, i) => ({
-      id: linkMetaRef.current[i]?.linkId,
-      from: model.getOffsetAt(r.getStartPosition()),
-      to: model.getOffsetAt(r.getEndPosition()),
+    const linkRanges = getDecorationRanges(model, noteState.linkDecoIds).map((r, i) => ({
+      id: noteState.linkMeta[i]?.linkId,
+      from: r ? model.getOffsetAt(r.getStartPosition()) : 0,
+      to: r ? model.getOffsetAt(r.getEndPosition()) : 0,
     }));
 
     const bookmark = hasSelection ? computeMarkMode(selFrom, selTo, bookmarkRanges) : { mode: "disabled" as const };
     const link = hasSelection ? computeMarkMode(selFrom, selTo, linkRanges) : { mode: "disabled" as const };
 
-    setToolbarState({
+    toolbarStateRef.current = {
       bookmarkMode: bookmark.mode,
       bookmarkRemoveId: bookmark.id,
       linkMode: link.mode,
       linkRemoveId: link.id,
-    });
+    };
   }
 
   // Judges direction per line (not per note) so a fully-English line inside
@@ -185,46 +149,28 @@ export function Editor({ fileId, fileName }: EditorProps) {
     else rtlLineDecosRef.current = editor.createDecorationsCollection(decos);
   }
 
-  function rebuildBookmarkDecorations(editor: monaco.editor.IStandaloneCodeEditor, ranges: monaco.Range[]) {
-    const decos = ranges.map((range) => ({ range, options: { inlineClassName: "bookmark-anchor", stickiness: STICKINESS } }));
-    if (bookmarkDecosRef.current) bookmarkDecosRef.current.set(decos);
-    else bookmarkDecosRef.current = editor.createDecorationsCollection(decos);
-  }
-
-  function rebuildLinkDecorations(editor: monaco.editor.IStandaloneCodeEditor, ranges: monaco.Range[]) {
-    const decos = ranges.map((range, i) => ({
-      range,
-      options: {
-        inlineClassName: linkMetaRef.current[i]?.broken ? "link-anchor link-anchor-broken" : "link-anchor",
-        stickiness: STICKINESS,
-      },
-    }));
-    if (linkDecosRef.current) linkDecosRef.current.set(decos);
-    else linkDecosRef.current = editor.createDecorationsCollection(decos);
-  }
-
   function removeBookmarkMark(bookmarkId: string) {
-    const editor = editorRef.current;
-    if (!editor) return;
-    const idx = bookmarkMetaRef.current.findIndex((m) => m.bookmarkId === bookmarkId);
+    const noteState = noteStateRef.current;
+    if (!noteState) return;
+    const idx = noteState.bookmarkMeta.findIndex((m) => m.bookmarkId === bookmarkId);
     if (idx === -1) return;
-    const ranges = (bookmarkDecosRef.current?.getRanges() ?? []).filter((_, i) => i !== idx);
-    bookmarkMetaRef.current = bookmarkMetaRef.current.filter((_, i) => i !== idx);
-    prevBookmarkWidthsRef.current.delete(bookmarkId);
-    rebuildBookmarkDecorations(editor, ranges);
+    const ranges = getDecorationRanges(noteState.model, noteState.bookmarkDecoIds).filter((_, i) => i !== idx);
+    noteState.bookmarkMeta = noteState.bookmarkMeta.filter((_, i) => i !== idx);
+    noteState.prevBookmarkWidths.delete(bookmarkId);
+    setBookmarkDecorations(noteState, ranges.filter((r): r is monaco.Range => !!r));
     removeBookmarkFromIndex(bookmarkId);
     refreshToolbarState();
   }
 
   function removeLinkMark(linkId: string) {
-    const editor = editorRef.current;
-    if (!editor) return;
-    const idx = linkMetaRef.current.findIndex((m) => m.linkId === linkId);
+    const noteState = noteStateRef.current;
+    if (!noteState) return;
+    const idx = noteState.linkMeta.findIndex((m) => m.linkId === linkId);
     if (idx === -1) return;
-    const meta = linkMetaRef.current[idx];
-    const ranges = (linkDecosRef.current?.getRanges() ?? []).filter((_, i) => i !== idx);
-    linkMetaRef.current = linkMetaRef.current.filter((_, i) => i !== idx);
-    rebuildLinkDecorations(editor, ranges);
+    const meta = noteState.linkMeta[idx];
+    const ranges = getDecorationRanges(noteState.model, noteState.linkDecoIds).filter((_, i) => i !== idx);
+    noteState.linkMeta = noteState.linkMeta.filter((_, i) => i !== idx);
+    setLinkDecorations(noteState, ranges.filter((r): r is monaco.Range => !!r));
     removeReferrerFromIndex(meta.targetBookmarkId, fileId);
     refreshToolbarState();
   }
@@ -238,19 +184,21 @@ export function Editor({ fileId, fileName }: EditorProps) {
     // (only the initial useRef(true) sets it true, and nothing else did).
     mountedRef.current = true;
 
+    const { state: noteState, isNew } = acquireNoteModel(fileId);
+    noteStateRef.current = noteState;
+    noteState.onEntangledShrink = (shrunkIds, entangledIds) =>
+      setPendingBookmarkDeletion({ kind: "shrink", shrunkIds, entangledIds });
+
     registerAttachmentUpdateHandler(fileId, (attachmentId, dataB64, size) => {
-      const next = latestAttachments.current.map((a) =>
-        a.id === attachmentId ? { ...a, data: dataB64, size } : a,
-      );
-      latestAttachments.current = next;
+      const next = noteState.attachments.map((a) => (a.id === attachmentId ? { ...a, data: dataB64, size } : a));
+      noteState.attachments = next;
       if (mountedRef.current) setAttachments(next);
-      latestContentRef.current = { ...latestContentRef.current, attachments: next };
-      flushSave();
+      noteState.latestContent = { ...noteState.latestContent, attachments: next };
+      flushSaveNow(fileId);
     });
 
     const editor = monaco.editor.create(containerRef.current, {
-      value: "",
-      language: "plaintext",
+      model: noteState.model,
       theme: currentThemeName(),
       automaticLayout: true,
       minimap: { enabled: false },
@@ -290,76 +238,28 @@ export function Editor({ fileId, fileName }: EditorProps) {
     });
     editorRef.current = editor;
     registerIndentCarryingEnter(editor);
+    // Bound per Monaco instance rather than globally, so they only fire for
+    // whichever tab/pane currently has editor focus — Monaco's own keybinding
+    // service already scopes addCommand this way.
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, () => handleBookmarkButtonClick());
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL, () => handleLinkButtonClick());
+    editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.LeftArrow, () => useVaultStore.getState().goBack());
+    editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.RightArrow, () => useVaultStore.getState().goForward());
     setEditorReady(true);
 
     const stopThemeWatch = watchThemeChanges((theme) => editor.updateOptions({ theme }));
 
     const disposables = [
+      // model.onDidChangeContent (equivalently, this) fires for edits made
+      // through ANY editor widget attached to this note's model, not just
+      // this one — so this only needs to refresh this widget's own toolbar/
+      // RTL-line visuals; the shared save/bookmark-shrink bookkeeping lives
+      // in noteModel.ts, registered once per note regardless of how many
+      // views of it are open.
       editor.onDidChangeModelContent(() => {
-        if (!loadedRef.current) {
-          // The user typed/pasted before the async loadNodeContent below resolved.
-          // Flag it so that callback preserves what's in the model instead of
-          // stomping it with the (now-stale) loaded content.
-          editedBeforeLoadRef.current = true;
-          return;
-        }
+        if (!noteState.loaded) return;
         const model = editor.getModel();
         if (!model) return;
-
-        const bookmarkRanges = bookmarkDecosRef.current?.getRanges() ?? [];
-        const nextBookmarks = bookmarkMetaRef.current.map((meta, i) => {
-          const r = bookmarkRanges[i];
-          return {
-            bookmarkId: meta.bookmarkId,
-            label: meta.label,
-            from: r ? model.getOffsetAt(r.getStartPosition()) : 0,
-            to: r ? model.getOffsetAt(r.getEndPosition()) : 0,
-          };
-        });
-
-        const linkRanges = linkDecosRef.current?.getRanges() ?? [];
-        const nextLinks = linkMetaRef.current.map((meta, i) => {
-          const r = linkRanges[i];
-          return {
-            linkId: meta.linkId,
-            targetBookmarkId: meta.targetBookmarkId,
-            from: r ? model.getOffsetAt(r.getStartPosition()) : 0,
-            to: r ? model.getOffsetAt(r.getEndPosition()) : 0,
-          };
-        });
-
-        if (!skipBookmarkCheckRef.current) {
-          const shrunkIds: string[] = [];
-          for (const b of nextBookmarks) {
-            const prevWidth = prevBookmarkWidthsRef.current.get(b.bookmarkId) ?? 0;
-            if (b.to - b.from < prevWidth) shrunkIds.push(b.bookmarkId);
-          }
-          if (shrunkIds.length > 0) {
-            const currentIndex = useVaultStore.getState().vault?.index ?? {};
-            const entangledIds = shrunkIds.filter((id) => (currentIndex[id]?.referrers.length ?? 0) > 0);
-            if (entangledIds.length > 0) {
-              editor.trigger("source", "undo", null);
-              setPendingBookmarkDeletion({ kind: "shrink", shrunkIds, entangledIds });
-              return;
-            }
-            for (const id of shrunkIds) {
-              const b = nextBookmarks.find((x) => x.bookmarkId === id);
-              if (b && b.to - b.from === 0) useVaultStore.getState().removeBookmarkFromIndex(id);
-            }
-          }
-        }
-        skipBookmarkCheckRef.current = false;
-        prevBookmarkWidthsRef.current = new Map(nextBookmarks.map((b) => [b.bookmarkId, b.to - b.from]));
-
-        latestContentRef.current = {
-          text: model.getValue(),
-          bookmarks: nextBookmarks,
-          links: nextLinks,
-          attachments: latestAttachments.current,
-        };
-        if (saveTimer.current) clearTimeout(saveTimer.current);
-        saveTimer.current = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
-
         refreshRtlLineDecorations(editor, model);
         refreshToolbarState();
       }),
@@ -370,95 +270,105 @@ export function Editor({ fileId, fileName }: EditorProps) {
         const model = editor.getModel();
         if (!model) return;
         const offset = model.getOffsetAt(e.target.position);
-        const ranges = linkDecosRef.current?.getRanges() ?? [];
+        const ranges = getDecorationRanges(model, noteState.linkDecoIds);
         for (let i = 0; i < ranges.length; i++) {
-          const from = model.getOffsetAt(ranges[i].getStartPosition());
-          const to = model.getOffsetAt(ranges[i].getEndPosition());
+          const range = ranges[i];
+          if (!range) continue;
+          const from = model.getOffsetAt(range.getStartPosition());
+          const to = model.getOffsetAt(range.getEndPosition());
           if (offset >= from && offset <= to) {
-            useVaultStore.getState().navigateToBookmark(linkMetaRef.current[i].targetBookmarkId);
+            useVaultStore.getState().navigateToBookmark(noteState.linkMeta[i].targetBookmarkId);
             return;
           }
         }
       }),
     ];
 
-    loadNodeContent(fileId).then((result) => {
-      if (cancelled) return;
-      const model = editor.getModel();
-      if (!model) return;
+    if (isNew) {
+      loadNodeContent(fileId).then((result) => {
+        if (cancelled) return;
+        const model = editor.getModel();
+        if (!model) return;
 
-      if (editedBeforeLoadRef.current) {
-        // Don't overwrite what the user already typed/pasted while this load
-        // was in flight. Its bookmarks/links refer to offsets in the old text,
-        // which no longer apply, so treat the current buffer as a fresh,
-        // mark-less note; attachments are unaffected by text edits, so keep those.
-        const attachments = result?.attachments ?? [];
-        latestAttachments.current = attachments;
-        setAttachments(attachments);
-        bookmarkMetaRef.current = [];
-        rebuildBookmarkDecorations(editor, []);
-        linkMetaRef.current = [];
-        rebuildLinkDecorations(editor, []);
-        prevBookmarkWidthsRef.current = new Map();
-        latestContentRef.current = { text: model.getValue(), bookmarks: [], links: [], attachments };
-        loadedRef.current = true;
+        if (noteState.editedBeforeLoad) {
+          // Don't overwrite what the user already typed/pasted while this load
+          // was in flight. Its bookmarks/links refer to offsets in the old text,
+          // which no longer apply, so treat the current buffer as a fresh,
+          // mark-less note; attachments are unaffected by text edits, so keep those.
+          const attachments = result?.attachments ?? [];
+          noteState.attachments = attachments;
+          setAttachments(attachments);
+          noteState.bookmarkMeta = [];
+          setBookmarkDecorations(noteState, []);
+          noteState.linkMeta = [];
+          setLinkDecorations(noteState, []);
+          noteState.prevBookmarkWidths = new Map();
+          noteState.latestContent = { text: model.getValue(), bookmarks: [], links: [], attachments };
+          noteState.loaded = true;
+          refreshRtlLineDecorations(editor, model);
+          refreshToolbarState();
+          return;
+        }
+
+        const content = result ?? { text: "", bookmarks: [], links: [], attachments: [] };
+        model.setValue(content.text);
+
+        const index = useVaultStore.getState().vault?.index ?? {};
+        noteState.bookmarkMeta = content.bookmarks.map((b) => ({ bookmarkId: b.bookmarkId, label: b.label }));
+        setBookmarkDecorations(
+          noteState,
+          content.bookmarks.map((b) => monaco.Range.fromPositions(model.getPositionAt(b.from), model.getPositionAt(b.to))),
+        );
+        noteState.linkMeta = content.links.map((l) => ({
+          linkId: l.linkId,
+          targetBookmarkId: l.targetBookmarkId,
+          broken: isLinkBroken(l, index),
+        }));
+        setLinkDecorations(
+          noteState,
+          content.links.map((l) => monaco.Range.fromPositions(model.getPositionAt(l.from), model.getPositionAt(l.to))),
+        );
+
+        noteState.attachments = content.attachments;
+        setAttachments(content.attachments);
+        noteState.prevBookmarkWidths = new Map(content.bookmarks.map((b) => [b.bookmarkId, b.to - b.from]));
+        noteState.latestContent = content;
+        noteState.loaded = true;
         refreshRtlLineDecorations(editor, model);
+
+        const targetBookmarkId = useVaultStore.getState().activeBookmarkId;
+        const target = targetBookmarkId ? content.bookmarks.find((b) => b.bookmarkId === targetBookmarkId) : undefined;
+        if (target) {
+          const pos = model.getPositionAt(target.from);
+          editor.revealLineInCenter(pos.lineNumber, monaco.editor.ScrollType.Immediate);
+        }
         refreshToolbarState();
-        if (saveTimer.current) clearTimeout(saveTimer.current);
-        saveTimer.current = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
-        return;
-      }
-
-      const content = result ?? EMPTY_CONTENT;
-      model.setValue(content.text);
-
-      const index = useVaultStore.getState().vault?.index ?? {};
-      bookmarkMetaRef.current = content.bookmarks.map((b) => ({ bookmarkId: b.bookmarkId, label: b.label }));
-      rebuildBookmarkDecorations(
-        editor,
-        content.bookmarks.map((b) => monaco.Range.fromPositions(model.getPositionAt(b.from), model.getPositionAt(b.to))),
-      );
-      linkMetaRef.current = content.links.map((l) => ({
-        linkId: l.linkId,
-        targetBookmarkId: l.targetBookmarkId,
-        broken: isLinkBroken(l, index),
-      }));
-      rebuildLinkDecorations(
-        editor,
-        content.links.map((l) => monaco.Range.fromPositions(model.getPositionAt(l.from), model.getPositionAt(l.to))),
-      );
-
-      latestAttachments.current = content.attachments;
-      setAttachments(content.attachments);
-      prevBookmarkWidthsRef.current = new Map(content.bookmarks.map((b) => [b.bookmarkId, b.to - b.from]));
-      latestContentRef.current = content;
-      loadedRef.current = true;
-      refreshRtlLineDecorations(editor, model);
-
-      const targetBookmarkId = useVaultStore.getState().activeBookmarkId;
-      const target = targetBookmarkId ? content.bookmarks.find((b) => b.bookmarkId === targetBookmarkId) : undefined;
-      if (target) {
-        const pos = model.getPositionAt(target.from);
-        editor.revealLineInCenter(pos.lineNumber, monaco.editor.ScrollType.Immediate);
-      }
-      refreshToolbarState();
-    }).catch((e) => {
-      if (cancelled) return;
-      console.error(`Failed to load note content for ${fileId}:`, e);
-      // loadedRef.current deliberately stays false: it gates every save (debounced
-      // autosave, and the flush-on-navigate-away in this effect's cleanup), and a
-      // decrypt failure is frequently transient/recoverable (e.g. a sync tool
-      // corrupting bytes on disk while the original content is still recoverable
-      // from a prior version/backup elsewhere). Auto-resetting to a blank note and
-      // marking it loaded — the previous behavior here — actively destroyed the
-      // real content by persisting the blank state over it on the very next
-      // autosave. Better to leave this note un-editable and unsaved than to
-      // silently commit a guess that erases something we can't get back.
-      editor.updateOptions({ readOnly: true });
-      useVaultStore.setState({
-        error: `"${fileName}" could not be read (its stored data is corrupted). Editing is disabled for this note so nothing gets overwritten — the previous content may still be recoverable from a backup. Do not delete this note.`,
+      }).catch((e) => {
+        if (cancelled) return;
+        console.error(`Failed to load note content for ${fileId}:`, e);
+        // noteState.loaded deliberately stays false: it gates every save (debounced
+        // autosave, and the flush-on-navigate-away in this effect's cleanup), and a
+        // decrypt failure is frequently transient/recoverable (e.g. a sync tool
+        // corrupting bytes on disk while the original content is still recoverable
+        // from a prior version/backup elsewhere). Auto-resetting to a blank note and
+        // marking it loaded — the previous behavior here — actively destroyed the
+        // real content by persisting the blank state over it on the very next
+        // autosave. Better to leave this note un-editable and unsaved than to
+        // silently commit a guess that erases something we can't get back.
+        editor.updateOptions({ readOnly: true });
+        useVaultStore.setState({
+          error: `"${fileName}" could not be read (its stored data is corrupted). Editing is disabled for this note so nothing gets overwritten — the previous content may still be recoverable from a backup. Do not delete this note.`,
+        });
       });
-    });
+    } else {
+      // A duplicate view attaching to an already-open, already-loaded note:
+      // reuse the existing shared state as-is (no content load needed).
+      setAttachments(noteState.attachments);
+      if (noteState.loaded) {
+        refreshRtlLineDecorations(editor, noteState.model);
+        refreshToolbarState();
+      }
+    }
 
     return () => {
       cancelled = true;
@@ -466,31 +376,29 @@ export function Editor({ fileId, fileName }: EditorProps) {
       unregisterAttachmentUpdateHandler(fileId);
       stopThemeWatch();
       for (const d of disposables) d.dispose();
-      if (saveTimer.current) {
-        clearTimeout(saveTimer.current);
-        saveTimer.current = null;
-      }
       if (rejectTimer.current) {
         clearTimeout(rejectTimer.current);
         rejectTimer.current = null;
       }
-      if (loadedRef.current) flushSave();
-      const model = editor.getModel();
+      if (noteState.loaded) flushSaveNow(fileId);
+      noteState.onEntangledShrink = null;
       editor.dispose();
-      model?.dispose();
+      releaseNoteModel(fileId);
       editorRef.current = null;
+      noteStateRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
-    if (!editorReady || !loadedRef.current || !activeBookmarkId) return;
+    if (!editorReady || !noteStateRef.current?.loaded || !activeBookmarkId) return;
     const editor = editorRef.current;
+    const noteState = noteStateRef.current;
     const model = editor?.getModel();
-    if (!editor || !model) return;
-    const idx = bookmarkMetaRef.current.findIndex((m) => m.bookmarkId === activeBookmarkId);
+    if (!editor || !model || !noteState) return;
+    const idx = noteState.bookmarkMeta.findIndex((m) => m.bookmarkId === activeBookmarkId);
     if (idx === -1) return;
-    const range = (bookmarkDecosRef.current?.getRanges() ?? [])[idx];
+    const range = getDecorationRanges(model, noteState.bookmarkDecoIds)[idx];
     if (!range) return;
     editor.revealLineInCenter(range.getStartPosition().lineNumber, monaco.editor.ScrollType.Smooth);
   }, [activeBookmarkId, editorReady]);
@@ -540,14 +448,15 @@ export function Editor({ fileId, fileName }: EditorProps) {
 
   function handleCreateBookmark(label: string) {
     const editor = editorRef.current;
+    const noteState = noteStateRef.current;
     const model = editor?.getModel();
     const range = getSelectionRange();
-    if (!editor || !model || !range) return;
+    if (!editor || !model || !range || !noteState) return;
     const bookmarkId = crypto.randomUUID();
-    bookmarkMetaRef.current = [...bookmarkMetaRef.current, { bookmarkId, label }];
-    const ranges = [...(bookmarkDecosRef.current?.getRanges() ?? []), range];
-    rebuildBookmarkDecorations(editor, ranges);
-    prevBookmarkWidthsRef.current.set(bookmarkId, model.getOffsetAt(range.getEndPosition()) - model.getOffsetAt(range.getStartPosition()));
+    noteState.bookmarkMeta = [...noteState.bookmarkMeta, { bookmarkId, label }];
+    const ranges = [...getDecorationRanges(model, noteState.bookmarkDecoIds).filter((r): r is monaco.Range => !!r), range];
+    setBookmarkDecorations(noteState, ranges);
+    noteState.prevBookmarkWidths.set(bookmarkId, model.getOffsetAt(range.getEndPosition()) - model.getOffsetAt(range.getStartPosition()));
     addBookmarkToIndex(bookmarkId, fileId);
     setShowNewBookmarkPopup(false);
     editor.focus();
@@ -555,12 +464,13 @@ export function Editor({ fileId, fileName }: EditorProps) {
 
   function handleCreateLink(targetBookmarkId: string) {
     const editor = editorRef.current;
+    const noteState = noteStateRef.current;
     const range = getSelectionRange();
-    if (!editor || !range) return;
+    if (!editor || !range || !noteState) return;
     const linkId = crypto.randomUUID();
-    linkMetaRef.current = [...linkMetaRef.current, { linkId, targetBookmarkId, broken: false }];
-    const ranges = [...(linkDecosRef.current?.getRanges() ?? []), range];
-    rebuildLinkDecorations(editor, ranges);
+    noteState.linkMeta = [...noteState.linkMeta, { linkId, targetBookmarkId, broken: false }];
+    const ranges = [...getDecorationRanges(noteState.model, noteState.linkDecoIds).filter((r): r is monaco.Range => !!r), range];
+    setLinkDecorations(noteState, ranges);
     addReferrerToIndex(targetBookmarkId, fileId);
     setShowLinkPicker(false);
     editor.focus();
@@ -575,14 +485,15 @@ export function Editor({ fileId, fileName }: EditorProps) {
       return;
     }
 
+    const noteState = noteStateRef.current;
     const editor = editorRef.current;
     const model = editor?.getModel();
-    if (!editor || !model) return;
-    skipBookmarkCheckRef.current = true;
-    editor.trigger("source", "redo", null);
-    const ranges = bookmarkDecosRef.current?.getRanges() ?? [];
+    if (!editor || !model || !noteState) return;
+    noteState.skipShrinkCheckOnce = true;
+    noteState.model.redo();
+    const ranges = getDecorationRanges(model, noteState.bookmarkDecoIds);
     for (const id of pendingBookmarkDeletion.entangledIds) {
-      const idx = bookmarkMetaRef.current.findIndex((m) => m.bookmarkId === id);
+      const idx = noteState.bookmarkMeta.findIndex((m) => m.bookmarkId === id);
       const r = idx >= 0 ? ranges[idx] : undefined;
       const width = r ? model.getOffsetAt(r.getEndPosition()) - model.getOffsetAt(r.getStartPosition()) : 0;
       if (width === 0) removeBookmarkFromIndex(id);
@@ -591,6 +502,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
   }
 
   function handleBookmarkButtonClick() {
+    const toolbarState = toolbarStateRef.current;
     const mode = toolbarState?.bookmarkMode ?? "disabled";
     if (mode === "create") {
       setShowNewBookmarkPopup(true);
@@ -608,6 +520,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
   }
 
   function handleLinkButtonClick() {
+    const toolbarState = toolbarStateRef.current;
     const mode = toolbarState?.linkMode ?? "disabled";
     if (mode === "create") {
       setShowLinkPicker(true);
@@ -630,25 +543,28 @@ export function Editor({ fileId, fileName }: EditorProps) {
     }
     if (accepted.length === 0) return;
 
+    const noteState = noteStateRef.current;
+    if (!noteState) return;
     // Reserve this note's save slot synchronously, before the FileReader-based
     // read below, so a fast switch-away-and-back can't have a freshly mounted
     // Editor for this note load in between the read finishing and this saving
     // — its loadNodeContent call would see this reservation and wait for it.
-    await runExclusive(fileId, async () => {
+    await useVaultStore.getState().runExclusive(fileId, async () => {
       const newAttachments = await Promise.all(accepted.map(fileToAttachment));
-      const next = [...latestAttachments.current, ...newAttachments];
-      latestAttachments.current = next;
+      const next = [...noteState.attachments, ...newAttachments];
+      noteState.attachments = next;
       if (mountedRef.current) setAttachments(next);
-      await saveNodeContentRaw(fileId, { ...latestContentRef.current, attachments: next });
+      await useVaultStore.getState().saveNodeContentRaw(fileId, { ...noteState.latestContent, attachments: next });
     });
   }
 
   function handleConfirmDeleteAttachment() {
-    if (!pendingDeleteAttachment) return;
-    const next = latestAttachments.current.filter((a) => a.id !== pendingDeleteAttachment.id);
-    latestAttachments.current = next;
+    const noteState = noteStateRef.current;
+    if (!pendingDeleteAttachment || !noteState) return;
+    const next = noteState.attachments.filter((a) => a.id !== pendingDeleteAttachment.id);
+    noteState.attachments = next;
     setAttachments(next);
-    flushSave();
+    flushSaveNow(fileId);
     void stopWatchForAttachment(fileId, pendingDeleteAttachment.id);
     setPendingDeleteAttachment(null);
   }
@@ -695,8 +611,6 @@ export function Editor({ fileId, fileName }: EditorProps) {
     if (e.dataTransfer.files.length > 0) handleAddAttachments(e.dataTransfer.files);
   }
 
-  const titleDir = detectDirection(fileName);
-
   return (
     <div
       className="editor"
@@ -705,34 +619,6 @@ export function Editor({ fileId, fileName }: EditorProps) {
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
-      <div className="editor-toolbar">
-        <button
-          className="icon-btn"
-          onClick={handleBookmarkButtonClick}
-          disabled={(toolbarState?.bookmarkMode ?? "disabled") === "disabled"}
-          title={toolbarState?.bookmarkMode === "remove" ? "Remove Bookmark" : "New Bookmark"}
-        >
-          <BookmarkIcon size={24} />
-        </button>
-        <button
-          className="icon-btn"
-          onClick={handleLinkButtonClick}
-          disabled={(toolbarState?.linkMode ?? "disabled") === "disabled"}
-          title={toolbarState?.linkMode === "remove" ? "Remove Link" : "New Link"}
-        >
-          <Link2 size={24} />
-        </button>
-
-        <span className="toolbar-divider spacer-left" />
-
-        <button className="icon-btn" onClick={goBack} disabled={navBack.length === 0} title="Back">
-          <ArrowLeft size={24} />
-        </button>
-        <button className="icon-btn" onClick={goForward} disabled={navForward.length === 0} title="Forward">
-          <ArrowRight size={24} />
-        </button>
-      </div>
-
       {rejectedNames.length > 0 && (
         <p className="attachment-reject-msg">
           {rejectedNames.length === 1
@@ -747,7 +633,6 @@ export function Editor({ fileId, fileName }: EditorProps) {
         onSaveAs={handleSaveAttachmentAs}
       />
 
-      <div className="editor-filename" dir={titleDir}>{fileName}</div>
       <div
         ref={containerRef}
         className="editor-content monaco-host"
