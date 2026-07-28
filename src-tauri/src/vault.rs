@@ -218,6 +218,62 @@ pub fn finalize_vault_write(temp_path: String, target_path: String) -> Result<()
     std::fs::rename(&temp_path, &target_path).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+pub fn vault_file_exists(path: String) -> bool {
+    std::fs::metadata(&path).is_ok()
+}
+
+// The local-only "live" copy each device keeps for a given cloud-facing vault
+// path never lives inside the synced folder itself (see resolve_live_vault_path),
+// so it needs its own deterministic location on this device. Copying between
+// live and cloud paths always goes through this: write the full file to a temp
+// path next to the destination, fsync it, then rename() over the destination.
+// The rename is atomic on NTFS, so any sync engine watching `dest_path` only
+// ever observes either the old complete file or the new complete file, never a
+// partial one -- this is what actually fixes torn reads, not the destination
+// being "just text".
+#[tauri::command]
+pub fn copy_file_atomic(source_path: String, dest_path: String) -> Result<(), String> {
+    let tmp_path = format!("{dest_path}.xfer.tmp");
+    std::fs::copy(&source_path, &tmp_path).map_err(|e| format!("copy to temp file failed: {e}"))?;
+    {
+        // FlushFileBuffers (what sync_all calls on Windows) needs a handle
+        // opened for write, not just read — File::open alone fails here with
+        // "Access is denied".
+        let f = OpenOptions::new()
+            .write(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("reopening temp file for fsync failed: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync of temp file failed: {e}"))?;
+    }
+    std::fs::rename(&tmp_path, &dest_path).map_err(|e| format!("rename over destination failed: {e}"))?;
+    Ok(())
+}
+
+// Deterministic per-device location for a vault's "live" working copy, derived
+// from the cloud-facing path the user actually opened (same stem+path-hash
+// scheme as backup_vault_file, just a different directory) so the same vault
+// always maps to the same local file on a given machine. Lives under the
+// app's local (non-roamed) data dir -- never inside a folder any sync client
+// watches -- so the frequent small in-place writes a text editor naturally
+// makes never give a sync engine a half-written file to pick up.
+#[tauri::command]
+pub fn resolve_live_vault_path(app: tauri::AppHandle, sync_path: String) -> Result<String, String> {
+    let mut dir = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
+    dir.push("live-vaults");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let stem = Path::new(&sync_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "vault".to_string());
+    let mut hasher = DefaultHasher::new();
+    sync_path.hash(&mut hasher);
+
+    dir.push(format!("{stem}-{:016x}.vlt", hasher.finish()));
+    Ok(dir.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +403,46 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vault_file_exists_reflects_reality() {
+        let path = temp_path("exists");
+        assert!(!vault_file_exists(path.clone()));
+        std::fs::write(&path, b"anything").unwrap();
+        assert!(vault_file_exists(path.clone()));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn copy_file_atomic_copies_content_and_leaves_source_untouched() {
+        let source = temp_path("copy-src");
+        let dest = temp_path("copy-dest");
+        std::fs::write(&source, b"live vault bytes").unwrap();
+
+        copy_file_atomic(source.clone(), dest.clone()).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"live vault bytes");
+        assert_eq!(std::fs::read(&source).unwrap(), b"live vault bytes");
+        // No leftover temp file from the copy-then-rename.
+        assert!(!Path::new(&format!("{dest}.xfer.tmp")).exists());
+
+        std::fs::remove_file(&source).ok();
+        std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn copy_file_atomic_overwrites_existing_destination() {
+        let source = temp_path("copy-src2");
+        let dest = temp_path("copy-dest2");
+        std::fs::write(&source, b"new content").unwrap();
+        std::fs::write(&dest, b"stale destination content that is longer").unwrap();
+
+        copy_file_atomic(source.clone(), dest.clone()).unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new content");
+
+        std::fs::remove_file(&source).ok();
+        std::fs::remove_file(&dest).ok();
     }
 }

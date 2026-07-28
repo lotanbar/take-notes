@@ -19,7 +19,7 @@ dist-ssr
 .DS_Store
 
 # Vault data files — personal notes, never belong in the repo
-*.vlt
+*.vlt*
 *.suo
 *.ntvs*
 *.njsproj

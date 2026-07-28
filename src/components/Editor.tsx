@@ -445,32 +445,18 @@ export function Editor({ fileId, fileName }: EditorProps) {
     }).catch((e) => {
       if (cancelled) return;
       console.error(`Failed to load note content for ${fileId}:`, e);
-      // Without this, loadedRef.current stays false forever for this Editor
-      // instance: every save (debounced autosave, and the flush-on-navigate-away
-      // in this effect's cleanup) is gated on it, so anything typed/pasted into
-      // a note whose stored blob failed to decrypt would silently never reach
-      // disk — indistinguishable from the text just vanishing. Recover by
-      // treating this like a corrupted note being reset: keep whatever's
-      // already in the buffer (nothing to lose from the unreadable old blob),
-      // mark it loaded so typing/pasting persists normally, and surface the
-      // failure so the user knows this note's prior content is gone rather
-      // than assuming it's still safely stored.
-      const model = editor.getModel();
-      latestAttachments.current = [];
-      setAttachments([]);
-      bookmarkMetaRef.current = [];
-      rebuildBookmarkDecorations(editor, []);
-      linkMetaRef.current = [];
-      rebuildLinkDecorations(editor, []);
-      prevBookmarkWidthsRef.current = new Map();
-      latestContentRef.current = { text: model?.getValue() ?? "", bookmarks: [], links: [], attachments: [] };
-      loadedRef.current = true;
-      if (model) {
-        refreshRtlLineDecorations(editor, model);
-        refreshToolbarState();
-      }
+      // loadedRef.current deliberately stays false: it gates every save (debounced
+      // autosave, and the flush-on-navigate-away in this effect's cleanup), and a
+      // decrypt failure is frequently transient/recoverable (e.g. a sync tool
+      // corrupting bytes on disk while the original content is still recoverable
+      // from a prior version/backup elsewhere). Auto-resetting to a blank note and
+      // marking it loaded — the previous behavior here — actively destroyed the
+      // real content by persisting the blank state over it on the very next
+      // autosave. Better to leave this note un-editable and unsaved than to
+      // silently commit a guess that erases something we can't get back.
+      editor.updateOptions({ readOnly: true });
       useVaultStore.setState({
-        error: `"${fileName}" could not be read (its stored data is corrupted) — starting from a blank note. Anything you type will now save normally, but the previous content of this note is lost.`,
+        error: `"${fileName}" could not be read (its stored data is corrupted). Editing is disabled for this note so nothing gets overwritten — the previous content may still be recoverable from a backup. Do not delete this note.`,
       });
     });
 

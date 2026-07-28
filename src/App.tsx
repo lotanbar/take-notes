@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FolderPlus, FolderOpen, FileText } from "lucide-react";
+import { FolderPlus, FolderOpen, FileText, X } from "lucide-react";
 import { useVaultStore } from "./store/vaultStore";
 import { useZoomStore } from "./store/zoomStore";
 import { useUiStore } from "./store/uiStore";
@@ -22,6 +22,7 @@ function App() {
   const flushForExit = useVaultStore((s) => s.flushForExit);
   const submitPassword = useVaultStore((s) => s.submitPassword);
   const cancelPassword = useVaultStore((s) => s.cancelPassword);
+  const clearError = useVaultStore((s) => s.clearError);
   const sessionUnlockedIds = useVaultStore((s) => s.sessionUnlockedIds);
   const activeFileId = useVaultStore((s) => s.activeFileId);
   const openFile = useVaultStore((s) => s.openFile);
@@ -122,7 +123,14 @@ function App() {
               Open New Vault
             </button>
           </div>
-          {error && <p className="error-text">{error}</p>}
+          {error && (
+            <div className="error-banner" role="alert">
+              <p className="error-text">{error}</p>
+              <button className="error-banner-dismiss" onClick={clearError} aria-label="Dismiss">
+                <X size={16} />
+              </button>
+            </div>
+          )}
           {passwordPromptProps && (
             <PasswordPrompt
               {...passwordPromptProps}
@@ -142,7 +150,14 @@ function App() {
         <Sidebar onOpenFile={openFile} />
         <main className={`main-area${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
           <div className="main-body">
-            {error && <p className="error-text">{error}</p>}
+            {error && (
+            <div className="error-banner" role="alert">
+              <p className="error-text">{error}</p>
+              <button className="error-banner-dismiss" onClick={clearError} aria-label="Dismiss">
+                <X size={16} />
+              </button>
+            </div>
+          )}
             {activeFileOpenable && activeNode ? (
               <Editor key={activeNode.id} fileId={activeNode.id} fileName={activeNode.name} />
             ) : (

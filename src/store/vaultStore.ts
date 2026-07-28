@@ -23,11 +23,15 @@ import {
   readVaultBlob,
   vaultCreateFresh,
   backupVaultFile,
+  vaultFileExists,
+  resolveLiveVaultPath,
+  copyFileAtomic,
   type VaultOpenResult,
 } from "../lib/vaultFileIO";
 import { migrateLegacyVault } from "../lib/vaultMigration";
 import { compactVaultTo, compactVaultInPlace } from "../lib/vaultCompaction";
 import { stopAllAttachmentWatches } from "../lib/attachmentWatch";
+import { getDeviceId } from "../lib/deviceId";
 import { convertTiptapDocToPlainText, type LegacyNode } from "../editor/legacyMigration";
 import {
   getLastVaultPath,
@@ -55,14 +59,76 @@ const pendingContentSaves = new Map<string, Promise<void>>();
 
 type PendingAction =
   | { kind: "vault-create"; path: string }
-  | { kind: "vault-open"; path: string; raw: VaultFile; legacy: false }
-  | { kind: "vault-open"; path: string; raw: LegacyVaultFile; legacy: true }
+  | { kind: "vault-open"; path: string; livePath: string; warning: string | null; raw: VaultFile; legacy: false }
+  | { kind: "vault-open"; path: string; livePath: string; warning: string | null; raw: LegacyVaultFile; legacy: true }
   | { kind: "node-lock"; id: string }
   | { kind: "node-unlock"; id: string };
 
 function parseOpenResult(result: VaultOpenResult): { raw: VaultFile | LegacyVaultFile; legacy: boolean } {
-  if (result.format === "v2") return { raw: JSON.parse(result.header) as VaultFile, legacy: false };
+  if (result.format === "v2") {
+    const raw = JSON.parse(result.header) as VaultFile;
+    // Older vaults predate the generation/deviceId fields — default them so
+    // downstream code can treat them as always present.
+    if (typeof raw.generation !== "number") raw.generation = 0;
+    if (typeof raw.deviceId !== "string") raw.deviceId = getDeviceId();
+    return { raw, legacy: false };
+  }
   return { raw: JSON.parse(result.contents) as LegacyVaultFile, legacy: true };
+}
+
+// `syncPath` is the cloud-facing path the user actually picked (what's shown
+// in the UI, remembered as "last vault path", and used as the identity key
+// for locally-cached sessions). It is never edited in place — see
+// prepareLiveVault below for why. Returns the local-only "live" path this
+// device should actually read/write, seeding or reconciling it against
+// whatever's currently at syncPath first.
+async function prepareLiveVault(syncPath: string): Promise<{ livePath: string; warning: string | null }> {
+  const livePath = await resolveLiveVaultPath(syncPath);
+  const liveExists = await vaultFileExists(livePath);
+  const syncExists = await vaultFileExists(syncPath);
+
+  if (!liveExists) {
+    if (!syncExists) return { livePath, warning: null };
+    try {
+      await openVaultFile(syncPath); // structural sanity check before adopting
+    } catch (e) {
+      throw new Error(
+        `Could not read "${syncPath}": ${String(e)}. It looks corrupted, and there's no local copy on this ` +
+          "device yet to fall back to.",
+      );
+    }
+    await copyFileAtomic(syncPath, livePath);
+    return { livePath, warning: null };
+  }
+
+  if (!syncExists) return { livePath, warning: null };
+
+  let syncResult: VaultOpenResult;
+  try {
+    syncResult = await openVaultFile(syncPath);
+  } catch (e) {
+    return {
+      livePath,
+      warning:
+        `The cloud copy at "${syncPath}" looks corrupted (${String(e)}) — continuing from this device's local ` +
+        "copy instead. It will be overwritten with a known-good copy the next time this vault saves.",
+    };
+  }
+  // Only v2 files carry a generation counter; if either side is still the
+  // legacy flat-JSON format, skip the comparison and just keep the local
+  // live copy (legacy vaults are migrated to v2 — with a fresh counter — the
+  // moment they're actually opened).
+  if (syncResult.format !== "v2") return { livePath, warning: null };
+  const syncGeneration = (JSON.parse(syncResult.header) as Partial<VaultFile>).generation ?? 0;
+
+  const liveResult = await openVaultFile(livePath);
+  if (liveResult.format !== "v2") return { livePath, warning: null };
+  const liveGeneration = (JSON.parse(liveResult.header) as Partial<VaultFile>).generation ?? 0;
+
+  if (syncGeneration > liveGeneration) {
+    await copyFileAtomic(syncPath, livePath);
+  }
+  return { livePath, warning: null };
 }
 
 function newRootNode(): TreeNode {
@@ -119,7 +185,12 @@ export interface SearchResult {
 }
 
 interface VaultState {
+  // The local-only working copy this device actually reads/writes — never
+  // inside a cloud-synced folder. See prepareLiveVault.
   filePath: string | null;
+  // The cloud-facing path the user opened/chose — what's shown in the UI and
+  // what the local live copy periodically gets published to.
+  syncPath: string | null;
   vault: VaultFile | null;
   masterKey: CryptoKey | null;
   dirty: boolean;
@@ -143,6 +214,7 @@ interface VaultState {
   tryAutoOpenLastVault: () => Promise<void>;
   submitPassword: (password: string) => Promise<void>;
   cancelPassword: () => void;
+  clearError: () => void;
   saveVault: () => Promise<void>;
   saveVaultAs: () => Promise<void>;
   lockVault: () => void;
@@ -187,18 +259,22 @@ interface VaultState {
 // sessions, and lands the store in the same "vault open" state either way.
 async function finalizeVaultOpen(
   set: (partial: Partial<VaultState>) => void,
-  path: string,
+  syncPath: string,
+  livePath: string,
   masterKey: CryptoKey,
   raw: VaultFile | LegacyVaultFile,
   legacy: boolean,
 ): Promise<void> {
-  const vault = legacy ? await migrateLegacyVault(path, raw as LegacyVaultFile) : (raw as VaultFile);
+  const vault = legacy ? await migrateLegacyVault(livePath, raw as LegacyVaultFile) : (raw as VaultFile);
 
   // Best-effort safety net: one full copy per open, not per edit, so a corrupt
   // append-in-progress can't lose more than the current session's edits.
-  void backupVaultFile(path, BACKUP_SUFFIX);
+  void backupVaultFile(livePath, BACKUP_SUFFIX);
 
-  const nodeSessions = loadNodeSessions(path);
+  // Keyed by syncPath (the vault's stable identity across devices), not
+  // livePath (which is derived from it and device-specific), so sessions
+  // survive this device's live copy being reseeded from the cloud.
+  const nodeSessions = loadNodeSessions(syncPath);
   const nodeKeys = new Map<string, CryptoKey>();
   const sessionUnlockedIds = new Set<string>();
   for (const [nodeId, s] of Object.entries(nodeSessions)) {
@@ -211,7 +287,8 @@ async function finalizeVaultOpen(
   }
 
   set({
-    filePath: path,
+    filePath: livePath,
+    syncPath,
     vault,
     masterKey,
     dirty: false,
@@ -230,6 +307,7 @@ async function finalizeVaultOpen(
 
 export const useVaultStore = create<VaultState>((set, get) => ({
   filePath: null,
+  syncPath: null,
   vault: null,
   masterKey: null,
   dirty: false,
@@ -258,10 +336,11 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   },
 
   openVault: async () => {
-    const { filePath: currentPath, vault: currentVault, dirty } = get();
-    if (currentPath && currentVault && dirty) {
+    const { filePath: currentLivePath, syncPath: currentSyncPath, vault: currentVault, dirty } = get();
+    if (currentLivePath && currentVault && dirty) {
       serializeVault(currentVault)
-        .then((headerJson) => writeVaultHeader(currentPath, headerJson))
+        .then((headerJson) => writeVaultHeader(currentLivePath, headerJson))
+        .then(() => (currentSyncPath ? copyFileAtomic(currentLivePath, currentSyncPath) : undefined))
         .catch(() => {});
     }
     const path = await open({
@@ -270,8 +349,12 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     });
     if (!path || Array.isArray(path)) return;
     try {
-      const { raw, legacy } = parseOpenResult(await openVaultFile(path));
-      set({ pending: { kind: "vault-open", path, raw, legacy } as PendingAction, passwordError: null });
+      const { livePath, warning } = await prepareLiveVault(path);
+      const { raw, legacy } = parseOpenResult(await openVaultFile(livePath));
+      set({
+        pending: { kind: "vault-open", path, livePath, warning, raw, legacy } as PendingAction,
+        passwordError: null,
+      });
     } catch (e) {
       set({ error: String(e) });
     }
@@ -282,7 +365,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const path = getLastVaultPath();
     if (!path) return;
     try {
-      const { raw, legacy } = parseOpenResult(await openVaultFile(path));
+      const { livePath, warning } = await prepareLiveVault(path);
+      const { raw, legacy } = parseOpenResult(await openVaultFile(livePath));
 
       const session = loadVaultSession(path);
       if (session) {
@@ -290,7 +374,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
           const key = await importKeyB64(session.keyB64);
           const decrypted = await decryptFromB64(key, raw.masterCheck);
           if (decrypted === MASTER_CHECK_SENTINEL) {
-            await finalizeVaultOpen(set, path, key, raw, legacy);
+            await finalizeVaultOpen(set, path, livePath, key, raw, legacy);
+            if (warning) set({ error: warning });
             return;
           }
         } catch {
@@ -298,7 +383,10 @@ export const useVaultStore = create<VaultState>((set, get) => ({
         }
       }
 
-      set({ pending: { kind: "vault-open", path, raw, legacy } as PendingAction, passwordError: null });
+      set({
+        pending: { kind: "vault-open", path, livePath, warning, raw, legacy } as PendingAction,
+        passwordError: null,
+      });
     } catch {
       // last vault file missing or unreadable — silently fall back to the landing screen
     }
@@ -310,6 +398,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
     if (pending.kind === "vault-create") {
       try {
+        const syncPath = pending.path;
+        const livePath = await resolveLiveVaultPath(syncPath);
         const salt = randomSaltB64();
         const key = await deriveKey(password, salt);
         const masterCheck = await encryptToB64(key, MASTER_CHECK_SENTINEL);
@@ -319,14 +409,18 @@ export const useVaultStore = create<VaultState>((set, get) => ({
           masterCheck,
           tree: newRootNode(),
           index: {},
+          generation: 1,
+          deviceId: getDeviceId(),
         };
-        await vaultCreateFresh(pending.path);
+        await vaultCreateFresh(livePath);
         const headerJson = await serializeVault(newVaultFile);
-        await writeVaultHeader(pending.path, headerJson);
-        setLastVaultPath(pending.path);
-        saveVaultSession(pending.path, await exportKeyB64(key));
+        await writeVaultHeader(livePath, headerJson);
+        await copyFileAtomic(livePath, syncPath); // initial publish
+        setLastVaultPath(syncPath);
+        saveVaultSession(syncPath, await exportKeyB64(key));
         set({
-          filePath: pending.path,
+          filePath: livePath,
+          syncPath,
           vault: newVaultFile,
           masterKey: key,
           dirty: false,
@@ -360,7 +454,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       setLastVaultPath(pending.path);
       saveVaultSession(pending.path, await exportKeyB64(key));
       try {
-        await finalizeVaultOpen(set, pending.path, key, pending.raw, pending.legacy);
+        await finalizeVaultOpen(set, pending.path, pending.livePath, key, pending.raw, pending.legacy);
+        if (pending.warning) set({ error: pending.warning });
       } catch (e) {
         set({ error: String(e), pending: null });
       }
@@ -399,8 +494,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       nodeKeys.set(pending.id, key);
       const sessionUnlockedIds = new Set(get().sessionUnlockedIds);
       sessionUnlockedIds.add(pending.id);
-      const { filePath } = get();
-      if (filePath) saveNodeSession(filePath, pending.id, await exportKeyB64(key));
+      const { syncPath } = get();
+      if (syncPath) saveNodeSession(syncPath, pending.id, await exportKeyB64(key));
       set({
         vault: { ...latestVault, tree: updatedTree },
         dirty: true,
@@ -424,8 +519,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
         nodeKeys.set(pending.id, key);
         const sessionUnlockedIds = new Set(get().sessionUnlockedIds);
         sessionUnlockedIds.add(pending.id);
-        const { filePath } = get();
-        if (filePath) saveNodeSession(filePath, pending.id, await exportKeyB64(key));
+        const { syncPath } = get();
+        if (syncPath) saveNodeSession(syncPath, pending.id, await exportKeyB64(key));
         set({ nodeKeys, sessionUnlockedIds, pending: null, passwordError: null });
       } catch {
         set({ passwordError: "Incorrect password." });
@@ -436,13 +531,20 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
   cancelPassword: () => set({ pending: null, passwordError: null }),
 
+  clearError: () => set({ error: null }),
+
   saveVault: async () => {
-    const { filePath, vault } = get();
+    const { filePath, syncPath, vault } = get();
     if (!filePath || !vault) return;
     try {
-      const headerJson = await serializeVault(vault);
+      // Bump the generation counter on every local header write — this is
+      // what lets a later open (on this device or another) tell whether the
+      // local live copy or the cloud copy actually has the newer edits.
+      const nextVault: VaultFile = { ...vault, generation: (vault.generation ?? 0) + 1, deviceId: getDeviceId() };
+      const headerJson = await serializeVault(nextVault);
       await writeVaultHeader(filePath, headerJson);
-      set({ dirty: false, error: null });
+      set({ vault: nextVault, dirty: false, error: null });
+      if (syncPath) schedulePublish(filePath, syncPath);
     } catch (e) {
       set({ error: String(e) });
     }
@@ -457,24 +559,38 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     });
     if (!path) return;
     try {
-      const compacted = await compactVaultTo(vault, filePath, path);
-      set({ vault: compacted, filePath: path, dirty: false, error: null });
+      cancelScheduledPublish();
+      const newLivePath = await resolveLiveVaultPath(path);
+      // compactVaultTo already produces a complete, correct file at newLivePath
+      // in one shot (no in-place mutation involved), so publishing it onward
+      // to the new cloud-facing path is just one more atomic copy.
+      const compacted = await compactVaultTo(vault, filePath, newLivePath);
+      await copyFileAtomic(newLivePath, path);
+      setLastVaultPath(path);
+      // Old syncPath's cached node-lock sessions are intentionally left
+      // behind, same as before this file's path-handling was reworked.
+      set({ vault: compacted, filePath: newLivePath, syncPath: path, dirty: false, error: null });
     } catch (e) {
       set({ error: String(e) });
     }
   },
 
   lockVault: () => {
-    const { filePath, vault } = get();
+    const { filePath, syncPath, vault } = get();
     if (!filePath || !vault) return;
+    cancelScheduledPublish();
     // Always compact (not just flush the header) so dead space from earlier
     // edits/deleted notes gets reclaimed on every lock, not only via the
     // rarely-used "Save As". Fire-and-forget: locking clears the master key
     // from memory immediately, same as before, rather than waiting on the
-    // rewrite of however much live content there is.
-    compactVaultInPlace(vault, filePath).catch(() => {});
+    // rewrite of however much live content there is. Publishing (copying the
+    // freshly-compacted live file out to the cloud path) is chained after so
+    // it doesn't run against a live file mid-compaction.
+    compactVaultInPlace(vault, filePath)
+      .then(() => (syncPath ? copyFileAtomic(filePath, syncPath) : undefined))
+      .catch(() => {});
     stopAllAttachmentWatches().catch(() => {});
-    clearVaultSession(filePath);
+    if (syncPath) clearVaultSession(syncPath);
     set({
       vault: null,
       masterKey: null,
@@ -493,12 +609,15 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
   // Called from the window's close-requested handler (see App.tsx) before it
   // lets the close actually go through, so quitting via the window controls
-  // compacts just like locking does -- covers the "just close the window"
-  // half of never touching Save As.
+  // compacts and publishes just like locking does -- covers the "just close
+  // the window" half of never touching Save As. Awaited by the caller, so the
+  // cloud copy is guaranteed up to date before the window actually closes.
   flushForExit: async () => {
-    const { filePath, vault } = get();
+    const { filePath, syncPath, vault } = get();
     if (!filePath || !vault) return;
+    cancelScheduledPublish();
     await compactVaultInPlace(vault, filePath).catch(() => {});
+    if (syncPath) await copyFileAtomic(filePath, syncPath).catch(() => {});
   },
 
   setSelection: (ids) => set({ selectedIds: ids }),
@@ -554,11 +673,11 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const nextTree = removeNodes(vault.tree, ids);
     const nextSessionUnlocked = new Set(sessionUnlockedIds);
     const nextNodeKeys = new Map(nodeKeys);
-    const { filePath } = get();
+    const { syncPath } = get();
     for (const id of deletedIds) {
       nextSessionUnlocked.delete(id);
       nextNodeKeys.delete(id);
-      if (filePath) clearNodeSession(filePath, id);
+      if (syncPath) clearNodeSession(syncPath, id);
     }
     set({
       vault: { ...vault, tree: nextTree, index: nextIndex },
@@ -590,8 +709,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       nextSessionUnlocked.delete(id);
       const nextNodeKeys = new Map(get().nodeKeys);
       nextNodeKeys.delete(id);
-      const { filePath } = get();
-      if (filePath) clearNodeSession(filePath, id);
+      const { syncPath } = get();
+      if (syncPath) clearNodeSession(syncPath, id);
       set({ sessionUnlockedIds: nextSessionUnlocked, nodeKeys: nextNodeKeys });
       return;
     }
@@ -600,7 +719,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   },
 
   removeNodeLock: async (id) => {
-    const { vault, sessionUnlockedIds, nodeKeys, filePath } = get();
+    const { vault, sessionUnlockedIds, nodeKeys, filePath, syncPath } = get();
     if (!vault || !filePath) return;
     const node = findNode(vault.tree, id);
     if (!node || !node.locked) return;
@@ -628,7 +747,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     nextSessionUnlocked.delete(id);
     const nextNodeKeys = new Map(nodeKeys);
     nextNodeKeys.delete(id);
-    clearNodeSession(filePath, id);
+    if (syncPath) clearNodeSession(syncPath, id);
     set({
       vault: { ...latestVault, tree: updatedTree },
       dirty: true,
@@ -928,6 +1047,35 @@ useVaultStore.subscribe((state) => {
     useVaultStore.getState().saveVault();
   }, AUTOSAVE_DEBOUNCE_MS);
 });
+
+// Publishing copies the whole live file out to the cloud-facing path, unlike
+// the local autosave above (which only rewrites the small header record) —
+// so it's debounced much less aggressively: only once edits have actually
+// settled, not on every keystroke-driven header write. lockVault/flushForExit
+// cancel this and publish immediately instead of waiting it out.
+const PUBLISH_DEBOUNCE_MS = 15000;
+let publishTimer: ReturnType<typeof setTimeout> | null = null;
+
+function schedulePublish(livePath: string, syncPath: string) {
+  if (publishTimer) clearTimeout(publishTimer);
+  publishTimer = setTimeout(() => {
+    publishTimer = null;
+    copyFileAtomic(livePath, syncPath).catch((e) => {
+      useVaultStore.setState({
+        error:
+          `Couldn't sync the vault to "${syncPath}": ${String(e)}. Your edits are saved safely on this device ` +
+          "and will sync automatically on the next save.",
+      });
+    });
+  }, PUBLISH_DEBOUNCE_MS);
+}
+
+function cancelScheduledPublish() {
+  if (publishTimer) {
+    clearTimeout(publishTimer);
+    publishTimer = null;
+  }
+}
 
 // Structural sharing: only clone the path from the root down to the edited node.
 // Sibling subtrees that don't contain `id` keep their original object references,

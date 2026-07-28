@@ -33,6 +33,13 @@ export interface VaultFile {
   masterCheck: string;
   tree: TreeNode;
   index: BookmarkIndex;
+  // Monotonic counter bumped on every local header write, plus the device
+  // that bumped it. Used to tell which of two candidate copies of this vault
+  // (the local live copy vs. whatever a cloud sync client handed back) is
+  // actually newer, without trusting file mtimes. Doesn't resolve true
+  // concurrent edits from two devices — that falls back to last-publish-wins.
+  generation: number;
+  deviceId: string;
 }
 
 // Pre-migration shape: content lived inline as a base64 ciphertext string

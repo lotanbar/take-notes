@@ -26,7 +26,7 @@ interface SidebarProps {
 
 export function Sidebar({ onOpenFile }: SidebarProps) {
   const vault = useVaultStore((s) => s.vault);
-  const filePath = useVaultStore((s) => s.filePath);
+  const filePath = useVaultStore((s) => s.syncPath);
   const selectedIds = useVaultStore((s) => s.selectedIds);
   const pending = useVaultStore((s) => s.pending);
   const setSelection = useVaultStore((s) => s.setSelection);

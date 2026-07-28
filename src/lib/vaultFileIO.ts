@@ -50,3 +50,20 @@ export function backupVaultFile(path: string, suffix: string): Promise<void> {
 export function finalizeVaultWrite(tempPath: string, targetPath: string): Promise<void> {
   return enqueue(() => invoke<void>("finalize_vault_write", { tempPath, targetPath }));
 }
+
+// Read-only / idempotent — deliberately not funneled through the write queue
+// so checking for a vault's local live copy doesn't wait behind unrelated work.
+export function vaultFileExists(path: string): Promise<boolean> {
+  return invoke<boolean>("vault_file_exists", { path });
+}
+
+export function resolveLiveVaultPath(syncPath: string): Promise<string> {
+  return invoke<string>("resolve_live_vault_path", { syncPath });
+}
+
+// Copies source -> dest via temp-file-then-rename (atomic on NTFS). Queued
+// alongside appends/header-writes so a copy out of (or into) the live vault
+// path can never race an in-progress local write to that same file.
+export function copyFileAtomic(sourcePath: string, destPath: string): Promise<void> {
+  return enqueue(() => invoke<void>("copy_file_atomic", { sourcePath, destPath }));
+}

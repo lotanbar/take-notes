@@ -1,4 +1,5 @@
 import type { LegacyTreeNode, LegacyVaultFile, TreeNode, VaultFile } from "../types/vault";
+import { getDeviceId } from "./deviceId";
 import { serializeVault } from "./serializeVault";
 import { appendVaultBlob, backupVaultFile, finalizeVaultWrite, vaultCreateFresh, writeVaultHeader } from "./vaultFileIO";
 
@@ -51,6 +52,8 @@ async function migrateLegacyVaultInner(path: string, legacy: LegacyVaultFile): P
     masterCheck: legacy.masterCheck,
     tree,
     index: legacy.index,
+    generation: 0,
+    deviceId: getDeviceId(),
   };
 
   const headerJson = await serializeVault(migrated);
