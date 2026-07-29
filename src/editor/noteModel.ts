@@ -148,20 +148,30 @@ function scheduleFlush(state: NoteModelState) {
   state.saveTimer = setTimeout(() => flushSave(state), SAVE_DEBOUNCE_MS);
 }
 
-function flushSave(state: NoteModelState) {
+function flushSave(state: NoteModelState): Promise<void> {
+  if (state.saveTimer) clearTimeout(state.saveTimer);
   state.saveTimer = null;
-  if (!state.loaded) return;
+  if (!state.loaded) return Promise.resolve();
   const { runExclusive, saveNodeContentRaw } = useVaultStore.getState();
-  runExclusive(state.fileId, () =>
+  return runExclusive(state.fileId, () =>
     saveNodeContentRaw(state.fileId, { ...state.latestContent, attachments: state.attachments }),
   );
 }
 
 // Exposed for callers that need an immediate (non-debounced) save, e.g. on
 // unmount or right after adding/removing an attachment.
-export function flushSaveNow(fileId: string): void {
+export function flushSaveNow(fileId: string): Promise<void> {
   const state = states.get(fileId);
-  if (state) flushSave(state);
+  return state ? flushSave(state) : Promise.resolve();
+}
+
+/** Flushes every loaded editor, including attachment changes, and resolves only after disk writes finish. */
+export async function flushAllDirtyNotes(): Promise<void> {
+  const work: Promise<void>[] = [];
+  for (const state of states.values()) {
+    if (state.saveTimer) work.push(flushSave(state));
+  }
+  await Promise.all(work);
 }
 
 function handleContentChange(state: NoteModelState) {

@@ -26,6 +26,10 @@ import {
   vaultFileExists,
   resolveLiveVaultPath,
   copyFileAtomic,
+  historyStatus,
+  historyInitialize,
+  historyCheckpoint,
+  type HistoryStatus,
   type VaultOpenResult,
 } from "../lib/vaultFileIO";
 import { migrateLegacyVault } from "../lib/vaultMigration";
@@ -61,6 +65,15 @@ type PendingAction =
   | { kind: "vault-create"; path: string }
   | { kind: "vault-open"; path: string; livePath: string; warning: string | null; raw: VaultFile; legacy: false }
   | { kind: "vault-open"; path: string; livePath: string; warning: string | null; raw: LegacyVaultFile; legacy: true }
+  | {
+      kind: "history-init";
+      path: string;
+      livePath: string;
+      warning: string | null;
+      raw: VaultFile;
+      key: CryptoKey;
+      history: HistoryStatus;
+    }
   | { kind: "node-lock"; id: string }
   | { kind: "node-unlock"; id: string };
 
@@ -214,10 +227,12 @@ interface VaultState {
   tryAutoOpenLastVault: () => Promise<void>;
   submitPassword: (password: string) => Promise<void>;
   cancelPassword: () => void;
+  initializeHistory: () => Promise<void>;
+  cancelHistory: () => void;
   clearError: () => void;
   saveVault: () => Promise<void>;
   saveVaultAs: () => Promise<void>;
-  lockVault: () => void;
+  lockVault: () => Promise<void>;
   flushForExit: () => Promise<void>;
 
   setSelection: (ids: string[]) => void;
@@ -239,10 +254,10 @@ interface VaultState {
   saveNodeContentRaw: (id: string, content: NodeContent) => Promise<void>;
   runExclusive: <T>(id: string, work: () => Promise<T>) => Promise<T>;
 
-  openFile: (node: TreeNode) => void;
-  navigateToBookmark: (targetBookmarkId: string) => void;
-  goBack: () => void;
-  goForward: () => void;
+  openFile: (node: TreeNode) => Promise<void>;
+  navigateToBookmark: (targetBookmarkId: string) => Promise<void>;
+  goBack: () => Promise<void>;
+  goForward: () => Promise<void>;
 
   addBookmarkToIndex: (bookmarkId: string, hostFileId: string) => void;
   removeBookmarkFromIndex: (bookmarkId: string) => void;
@@ -303,6 +318,98 @@ async function finalizeVaultOpen(
     navBack: [],
     navForward: [],
   });
+}
+
+async function openAfterHistoryCheck(
+  set: (partial: Partial<VaultState>) => void,
+  path: string,
+  livePath: string,
+  key: CryptoKey,
+  raw: VaultFile | LegacyVaultFile,
+  legacy: boolean,
+  warning: string | null,
+): Promise<void> {
+  // Migration is completed before the first history snapshot, so even an old
+  // vault's initial commit contains the same complete v2 file the editor uses.
+  const prepared = legacy ? await migrateLegacyVault(livePath, raw as LegacyVaultFile) : (raw as VaultFile);
+  const history = await historyStatus(path);
+  if (history.status !== "ready") {
+    set({
+      filePath: null,
+      syncPath: null,
+      vault: null,
+      masterKey: null,
+      pending: { kind: "history-init", path, livePath, warning, raw: prepared, key, history },
+      passwordError: null,
+    });
+    return;
+  }
+  await finalizeVaultOpen(set, path, livePath, key, prepared, false);
+  if (warning) set({ error: warning });
+}
+
+async function checkpointOpenVault(
+  get: () => VaultState,
+  set: (partial: Partial<VaultState>) => void,
+  reason: string,
+  compactAndPublish: boolean,
+): Promise<void> {
+  const { flushAllDirtyNotes } = await import("../editor/noteModel");
+  await flushAllDirtyNotes();
+  await Promise.all([...pendingContentSaves.values()]);
+
+  let { filePath, syncPath, vault, dirty } = get();
+  if (!filePath || !syncPath || !vault) return;
+  if (dirty) {
+    vault = { ...vault, generation: (vault.generation ?? 0) + 1, deviceId: getDeviceId() };
+    await writeVaultHeader(filePath, await serializeVault(vault));
+    set({ vault, dirty: false });
+  }
+  if (compactAndPublish) {
+    vault = await compactVaultInPlace(vault, filePath);
+    set({ vault, dirty: false });
+    await copyFileAtomic(filePath, syncPath);
+  }
+  await historyCheckpoint(syncPath, filePath, reason);
+}
+
+function clearOpenVault(set: (partial: Partial<VaultState>) => void, error: string | null = null) {
+  set({
+    vault: null,
+    filePath: null,
+    syncPath: null,
+    masterKey: null,
+    dirty: false,
+    error,
+    sessionUnlockedIds: new Set(),
+    nodeKeys: new Map(),
+    selectedIds: [],
+    activeFileId: null,
+    activeBookmarkId: null,
+    navBack: [],
+    navForward: [],
+    pending: null,
+    passwordError: null,
+  });
+}
+
+async function checkpointAfterNavigation(
+  get: () => VaultState,
+  set: (partial: Partial<VaultState>) => void,
+  previousFileId: string | null,
+  targetFileId: string,
+): Promise<boolean> {
+  if (!previousFileId || previousFileId === targetFileId) return true;
+  try {
+    await checkpointOpenVault(get, set, `Switched from ${findNode(get().vault!.tree, previousFileId)?.name ?? "note"}`, false);
+    return true;
+  } catch (e) {
+    const syncPath = get().syncPath;
+    await stopAllAttachmentWatches().catch(() => {});
+    if (syncPath) clearVaultSession(syncPath);
+    clearOpenVault(set, `Recovery history failed; the vault was locked: ${String(e)}`);
+    return false;
+  }
 }
 
 export const useVaultStore = create<VaultState>((set, get) => ({
@@ -374,8 +481,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
           const key = await importKeyB64(session.keyB64);
           const decrypted = await decryptFromB64(key, raw.masterCheck);
           if (decrypted === MASTER_CHECK_SENTINEL) {
-            await finalizeVaultOpen(set, path, livePath, key, raw, legacy);
-            if (warning) set({ error: warning });
+            await openAfterHistoryCheck(set, path, livePath, key, raw, legacy, warning);
             return;
           }
         } catch {
@@ -418,23 +524,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
         await copyFileAtomic(livePath, syncPath); // initial publish
         setLastVaultPath(syncPath);
         saveVaultSession(syncPath, await exportKeyB64(key));
-        set({
-          filePath: livePath,
-          syncPath,
-          vault: newVaultFile,
-          masterKey: key,
-          dirty: false,
-          error: null,
-          pending: null,
-          passwordError: null,
-          sessionUnlockedIds: new Set(),
-          nodeKeys: new Map(),
-          selectedIds: [],
-          activeFileId: null,
-          activeBookmarkId: null,
-          navBack: [],
-          navForward: [],
-        });
+        await openAfterHistoryCheck(set, syncPath, livePath, key, newVaultFile, false, null);
       } catch (e) {
         set({ error: String(e), pending: null });
       }
@@ -454,8 +544,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       setLastVaultPath(pending.path);
       saveVaultSession(pending.path, await exportKeyB64(key));
       try {
-        await finalizeVaultOpen(set, pending.path, pending.livePath, key, pending.raw, pending.legacy);
-        if (pending.warning) set({ error: pending.warning });
+        await openAfterHistoryCheck(set, pending.path, pending.livePath, key, pending.raw, pending.legacy, pending.warning);
       } catch (e) {
         set({ error: String(e), pending: null });
       }
@@ -531,6 +620,27 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
   cancelPassword: () => set({ pending: null, passwordError: null }),
 
+  initializeHistory: async () => {
+    const pending = get().pending;
+    if (!pending || pending.kind !== "history-init") return;
+    try {
+      await historyInitialize(pending.path, pending.livePath);
+      setLastVaultPath(pending.path);
+      saveVaultSession(pending.path, await exportKeyB64(pending.key));
+      await finalizeVaultOpen(set, pending.path, pending.livePath, pending.key, pending.raw, false);
+      if (pending.warning) set({ error: pending.warning });
+    } catch (e) {
+      clearVaultSession(pending.path);
+      set({ pending: null, vault: null, masterKey: null, error: `Could not create required recovery history: ${String(e)}` });
+    }
+  },
+
+  cancelHistory: () => {
+    const pending = get().pending;
+    if (pending?.kind === "history-init") clearVaultSession(pending.path);
+    set({ pending: null, vault: null, masterKey: null, passwordError: null });
+  },
+
   clearError: () => set({ error: null }),
 
   saveVault: async () => {
@@ -551,8 +661,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   },
 
   saveVaultAs: async () => {
-    const { vault, filePath } = get();
-    if (!vault || !filePath) return;
+    let { vault, filePath, masterKey } = get();
+    if (!vault || !filePath || !masterKey) return;
     const path = await save({
       filters: [{ name: "Vault", extensions: ["vlt"] }],
       defaultPath: "untitled.vlt",
@@ -560,51 +670,34 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     if (!path) return;
     try {
       cancelScheduledPublish();
+      await checkpointOpenVault(get, set, "Before Save As", false);
+      ({ vault, filePath, masterKey } = get());
+      if (!vault || !filePath || !masterKey) return;
       const newLivePath = await resolveLiveVaultPath(path);
       // compactVaultTo already produces a complete, correct file at newLivePath
       // in one shot (no in-place mutation involved), so publishing it onward
       // to the new cloud-facing path is just one more atomic copy.
       const compacted = await compactVaultTo(vault, filePath, newLivePath);
       await copyFileAtomic(newLivePath, path);
-      setLastVaultPath(path);
-      // Old syncPath's cached node-lock sessions are intentionally left
-      // behind, same as before this file's path-handling was reworked.
-      set({ vault: compacted, filePath: newLivePath, syncPath: path, dirty: false, error: null });
+      await openAfterHistoryCheck(set, path, newLivePath, masterKey, compacted, false, null);
     } catch (e) {
       set({ error: String(e) });
     }
   },
 
-  lockVault: () => {
+  lockVault: async () => {
     const { filePath, syncPath, vault } = get();
     if (!filePath || !vault) return;
     cancelScheduledPublish();
-    // Always compact (not just flush the header) so dead space from earlier
-    // edits/deleted notes gets reclaimed on every lock, not only via the
-    // rarely-used "Save As". Fire-and-forget: locking clears the master key
-    // from memory immediately, same as before, rather than waiting on the
-    // rewrite of however much live content there is. Publishing (copying the
-    // freshly-compacted live file out to the cloud path) is chained after so
-    // it doesn't run against a live file mid-compaction.
-    compactVaultInPlace(vault, filePath)
-      .then(() => (syncPath ? copyFileAtomic(filePath, syncPath) : undefined))
-      .catch(() => {});
-    stopAllAttachmentWatches().catch(() => {});
+    let failure: string | null = null;
+    try {
+      await checkpointOpenVault(get, set, "Vault locked", true);
+    } catch (e) {
+      failure = `Recovery history failed; the vault was locked: ${String(e)}`;
+    }
+    await stopAllAttachmentWatches().catch(() => {});
     if (syncPath) clearVaultSession(syncPath);
-    set({
-      vault: null,
-      masterKey: null,
-      dirty: false,
-      sessionUnlockedIds: new Set(),
-      nodeKeys: new Map(),
-      selectedIds: [],
-      activeFileId: null,
-      activeBookmarkId: null,
-      navBack: [],
-      navForward: [],
-      pending: null,
-      passwordError: null,
-    });
+    clearOpenVault(set, failure);
   },
 
   // Called from the window's close-requested handler (see App.tsx) before it
@@ -613,11 +706,9 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   // the window" half of never touching Save As. Awaited by the caller, so the
   // cloud copy is guaranteed up to date before the window actually closes.
   flushForExit: async () => {
-    const { filePath, syncPath, vault } = get();
-    if (!filePath || !vault) return;
+    if (!get().vault) return;
     cancelScheduledPublish();
-    await compactVaultInPlace(vault, filePath).catch(() => {});
-    if (syncPath) await copyFileAtomic(filePath, syncPath).catch(() => {});
+    await checkpointOpenVault(get, set, "Application closed", true);
   },
 
   setSelection: (ids) => set({ selectedIds: ids }),
@@ -866,16 +957,18 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
   saveNodeContent: (id, content) => get().runExclusive(id, () => get().saveNodeContentRaw(id, content)),
 
-  openFile: (node) => {
+  openFile: async (node) => {
     const { sessionUnlockedIds } = get();
     if (node.locked && !sessionUnlockedIds.has(node.id)) {
       get().toggleNodeLock(node.id);
       return;
     }
+    const previous = get().activeFileId;
     set({ activeFileId: node.id, activeBookmarkId: null });
+    await checkpointAfterNavigation(get, set, previous, node.id);
   },
 
-  navigateToBookmark: (targetBookmarkId) => {
+  navigateToBookmark: async (targetBookmarkId) => {
     const { vault, activeFileId, activeBookmarkId, sessionUnlockedIds, navBack } = get();
     if (!vault) return;
     const entry = vault.index[targetBookmarkId];
@@ -893,9 +986,10 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       navBack: nextBack,
       navForward: [],
     });
+    await checkpointAfterNavigation(get, set, activeFileId, entry.hostFileId);
   },
 
-  goBack: () => {
+  goBack: async () => {
     const { navBack, navForward, activeFileId, activeBookmarkId } = get();
     if (navBack.length === 0) return;
     const prev = navBack[navBack.length - 1];
@@ -908,9 +1002,10 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       navBack: navBack.slice(0, -1),
       navForward: nextForward,
     });
+    await checkpointAfterNavigation(get, set, activeFileId, prev.fileId);
   },
 
-  goForward: () => {
+  goForward: async () => {
     const { navBack, navForward, activeFileId, activeBookmarkId } = get();
     if (navForward.length === 0) return;
     const next = navForward[navForward.length - 1];
@@ -921,6 +1016,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       navBack: nextBack,
       navForward: navForward.slice(0, -1),
     });
+    await checkpointAfterNavigation(get, set, activeFileId, next.fileId);
   },
 
   addBookmarkToIndex: (bookmarkId, hostFileId) => {

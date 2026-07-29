@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, FolderOpen, FileText, X } from "lucide-react";
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent } from "dockview-react";
 import { useVaultStore } from "./store/vaultStore";
@@ -7,6 +8,7 @@ import { useZoomStore } from "./store/zoomStore";
 import { useUiStore } from "./store/uiStore";
 import { Sidebar } from "./components/Sidebar";
 import { PasswordPrompt } from "./components/PasswordPrompt";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { EditorPanel, type NotePanelParams } from "./components/EditorPanel";
 import { findNode, flattenTree } from "./lib/treeOps";
 import { loadLayout, saveLayout } from "./lib/sessionStore";
@@ -38,6 +40,8 @@ function App() {
   const submitPassword = useVaultStore((s) => s.submitPassword);
   const cancelPassword = useVaultStore((s) => s.cancelPassword);
   const clearError = useVaultStore((s) => s.clearError);
+  const initializeHistory = useVaultStore((s) => s.initializeHistory);
+  const cancelHistory = useVaultStore((s) => s.cancelHistory);
   const sessionUnlockedIds = useVaultStore((s) => s.sessionUnlockedIds);
   const activeFileId = useVaultStore((s) => s.activeFileId);
   const activeBookmarkId = useVaultStore((s) => s.activeBookmarkId);
@@ -80,6 +84,15 @@ function App() {
   function handleDockviewReady(event: DockviewReadyEvent) {
     dockviewApiRef.current = event.api;
     event.api.onDidLayoutChange(scheduleSaveLayout);
+    event.api.onDidActivePanelChange(({ panel, origin }) => {
+      if (origin !== "user" || !panel) return;
+      const params = panel.params as NotePanelParams;
+      const state = useVaultStore.getState();
+      if (!state.vault || !params.fileId || params.fileId === state.activeFileId) return;
+
+      const node = findNode(state.vault.tree, params.fileId);
+      if (node) void state.openFile(node);
+    });
   }
 
   // Restores the previous session's tabs/layout once per vault open (not on
@@ -168,10 +181,24 @@ function App() {
     const win = getCurrentWindow();
     const unlistenPromise = win.onCloseRequested(async (event) => {
       event.preventDefault();
-      try {
-        await flushForExit();
-      } finally {
-        await win.destroy();
+      await win.hide();
+      for (;;) {
+        try {
+          await flushForExit();
+          await win.destroy();
+          break;
+        } catch (e) {
+          await win.show();
+          const retry = await confirm(
+            `The final recovery-history checkpoint failed:\n\n${String(e)}\n\nRetry, or use Emergency Exit to close without a final backup.`,
+            { title: "Vault history failure", kind: "warning", okLabel: "Retry", cancelLabel: "Emergency Exit" },
+          );
+          if (!retry) {
+            await win.destroy();
+            break;
+          }
+          await win.hide();
+        }
       }
     });
     return () => {
@@ -208,6 +235,8 @@ function App() {
         return { mode: "create" as const, title: "Set Lock Password" };
       case "node-unlock":
         return { mode: "verify" as const, title: "Enter Node Password" };
+      case "history-init":
+        return null;
     }
   })();
 
@@ -240,6 +269,14 @@ function App() {
               error={passwordError}
               onSubmit={submitPassword}
               onCancel={cancelPassword}
+            />
+          )}
+          {pending?.kind === "history-init" && (
+            <ConfirmDialog
+              title="Recovery history required"
+              message={`This vault requires two synchronized local Git recovery histories:\n${pending.history.repositoryPath}\n${pending.history.mirrorRepositoryPath}`}
+              actions={[{ label: "Create History", onClick: () => void initializeHistory() }]}
+              onCancel={cancelHistory}
             />
           )}
         </main>

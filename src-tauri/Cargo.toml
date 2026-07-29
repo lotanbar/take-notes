@@ -1,6 +1,6 @@
 [package]
 name = "vault-notes-app"
-version = "0.3.6"
+version = "0.3.7"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -25,4 +25,5 @@ base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 notify = "6"
 notify-debouncer-mini = "0.4"
-
+git2 = { version = "0.20", default-features = false }
+sha2 = "0.10"

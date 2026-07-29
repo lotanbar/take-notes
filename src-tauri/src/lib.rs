@@ -1,6 +1,7 @@
 mod attachment_watch;
 mod attachments;
 mod vault;
+mod history;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -25,6 +26,9 @@ pub fn run() {
             vault::vault_file_exists,
             vault::copy_file_atomic,
             vault::resolve_live_vault_path,
+            history::history_status,
+            history::history_initialize,
+            history::history_checkpoint,
             attachments::write_temp_attachment,
             attachments::save_attachment_to_path,
             attachment_watch::start_attachment_watch,

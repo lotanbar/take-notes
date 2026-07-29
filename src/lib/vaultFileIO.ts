@@ -2,6 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 import type { ContentRef } from "../types/vault";
 
 export type VaultOpenResult = { format: "v2"; header: string } | { format: "legacy"; contents: string };
+export type HistoryState = "ready" | "missing" | "corrupt" | "path_mismatch";
+export interface HistoryStatus {
+  status: HistoryState;
+  repositoryPath: string;
+  mirrorRepositoryPath: string;
+  detail: string | null;
+}
 
 // The v2 container format (src-tauri/src/vault.rs) is append-only: every write
 // truncates off just the trailing 24-byte trailer and appends fresh bytes.
@@ -66,4 +73,16 @@ export function resolveLiveVaultPath(syncPath: string): Promise<string> {
 // path can never race an in-progress local write to that same file.
 export function copyFileAtomic(sourcePath: string, destPath: string): Promise<void> {
   return enqueue(() => invoke<void>("copy_file_atomic", { sourcePath, destPath }));
+}
+
+export function historyStatus(sourcePath: string): Promise<HistoryStatus> {
+  return invoke<HistoryStatus>("history_status", { sourcePath });
+}
+
+export function historyInitialize(sourcePath: string, vaultPath: string): Promise<HistoryStatus> {
+  return enqueue(() => invoke<HistoryStatus>("history_initialize", { sourcePath, vaultPath }));
+}
+
+export function historyCheckpoint(sourcePath: string, vaultPath: string, reason: string): Promise<boolean> {
+  return enqueue(() => invoke<boolean>("history_checkpoint", { sourcePath, vaultPath, reason }));
 }

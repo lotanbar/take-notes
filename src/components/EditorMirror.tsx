@@ -27,6 +27,7 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
   const editorZoom = useZoomStore((s) => s.editorZoom);
   const [editorReady, setEditorReady] = useState(false);
 
+
   function refreshRtlLineDecorations(editor: monaco.editor.IStandaloneCodeEditor, model: monaco.editor.ITextModel) {
     const decos: { range: monaco.Range; options: monaco.editor.IModelDecorationOptions }[] = [];
     for (let line = 1; line <= model.getLineCount(); line++) {
