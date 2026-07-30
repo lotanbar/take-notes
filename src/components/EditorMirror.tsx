@@ -23,7 +23,7 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const rtlLineDecosRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
-  const uiZoom = useZoomStore((s) => s.uiZoom);
+  const chromeZoom = useZoomStore((s) => s.chromeZoom);
   const editorZoom = useZoomStore((s) => s.editorZoom);
   const [editorReady, setEditorReady] = useState(false);
 
@@ -112,9 +112,9 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor || !editorReady) return;
-    editor.updateOptions({ fontSize: BASE_FONT_SIZE * (editorZoom / uiZoom) });
+    editor.updateOptions({ fontSize: BASE_FONT_SIZE * (editorZoom / chromeZoom) });
     editor.layout();
-  }, [editorZoom, uiZoom, editorReady]);
+  }, [editorZoom, chromeZoom, editorReady]);
 
   return (
     <div className="editor editor-mirror">

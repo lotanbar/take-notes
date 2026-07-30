@@ -22,9 +22,10 @@ import type { TreeNode } from "../types/vault";
 
 interface SidebarProps {
   onOpenFile: (node: TreeNode) => void;
+  zoomScale: number;
 }
 
-export function Sidebar({ onOpenFile }: SidebarProps) {
+export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
   const vault = useVaultStore((s) => s.vault);
   const filePath = useVaultStore((s) => s.syncPath);
   const selectedIds = useVaultStore((s) => s.selectedIds);
@@ -67,16 +68,17 @@ export function Sidebar({ onOpenFile }: SidebarProps) {
   }
   function handleResizeMouseMove(e: MouseEvent) {
     if (!draggingRef.current) return;
-    const max = window.innerWidth * SIDEBAR_MAX_RATIO;
-    if (e.clientX < MIN_SIDEBAR_WIDTH) {
+    const pointerX = e.clientX / zoomScale;
+    const max = (window.innerWidth * SIDEBAR_MAX_RATIO) / zoomScale;
+    if (pointerX < MIN_SIDEBAR_WIDTH) {
       // Freeze the visible width at the minimum instead of shrinking further;
       // past a further drag distance, arm a full collapse on release.
       setSidebarWidth(MIN_SIDEBAR_WIDTH);
-      const armed = MIN_SIDEBAR_WIDTH - e.clientX >= COLLAPSE_DRAG_DISTANCE;
+      const armed = MIN_SIDEBAR_WIDTH - pointerX >= COLLAPSE_DRAG_DISTANCE;
       collapseArmedRef.current = armed;
       setCollapseArmed(armed);
     } else {
-      setSidebarWidth(Math.min(e.clientX, max));
+      setSidebarWidth(Math.min(pointerX, max));
       collapseArmedRef.current = false;
       setCollapseArmed(false);
     }
@@ -213,7 +215,7 @@ export function Sidebar({ onOpenFile }: SidebarProps) {
   return (
     <div
       className={`sidebar${collapsed ? " collapsed" : ""}`}
-      style={{ width: collapsed ? 0 : sidebarWidth }}
+      style={{ width: collapsed ? 0 : sidebarWidth, zoom: zoomScale }}
       ref={sidebarRef}
     >
       {collapsed && (

@@ -75,7 +75,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
   const addReferrerToIndex = useVaultStore((s) => s.addReferrerToIndex);
   const removeReferrerFromIndex = useVaultStore((s) => s.removeReferrerFromIndex);
   const activeBookmarkId = useVaultStore((s) => s.activeBookmarkId);
-  const uiZoom = useZoomStore((s) => s.uiZoom);
+  const chromeZoom = useZoomStore((s) => s.chromeZoom);
   const editorZoom = useZoomStore((s) => s.editorZoom);
 
   const containerRef = useRef<HTMLDivElement>(null);
@@ -406,9 +406,9 @@ export function Editor({ fileId, fileName }: EditorProps) {
   useEffect(() => {
     const editor = editorRef.current;
     if (!editor || !editorReady) return;
-    editor.updateOptions({ fontSize: BASE_FONT_SIZE * (editorZoom / uiZoom) });
+    editor.updateOptions({ fontSize: BASE_FONT_SIZE * (editorZoom / chromeZoom) });
     editor.layout();
-  }, [editorZoom, uiZoom, editorReady]);
+  }, [editorZoom, chromeZoom, editorReady]);
 
   useEffect(() => {
     function down(e: KeyboardEvent) {

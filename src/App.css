@@ -184,6 +184,7 @@ button.primary:disabled {
 /* App shell */
 
 .app-shell {
+  --top-pane-height: 36px;
   display: flex;
   flex: 1;
   min-height: 0;
@@ -264,18 +265,23 @@ body.resizing-sidebar .sidebar-resize-handle {
   flex-wrap: nowrap;
   align-items: center;
   gap: 0;
-  padding: 6px 8px;
+  height: var(--top-pane-height);
+  padding: 1px 6px;
   border-bottom: 1px solid var(--border);
 }
 
 .icon-btn {
-  width: 38px;
-  height: 38px;
+  width: 32px;
+  height: 32px;
   padding: 0;
   border-color: transparent;
   background-color: transparent;
   color: var(--text-0);
   transition: background-color 0.12s ease;
+}
+.toolbar .icon-btn .lucide {
+  width: 22px;
+  height: 22px;
 }
 .icon-btn:hover {
   background-color: var(--bg-2);
@@ -379,8 +385,9 @@ body.resizing-sidebar .sidebar-resize-handle {
   /* dockview's "vs" theme ships a second, more compact override of these two
      (20px/11px) later in its stylesheet — restore VS Code's actual tab
      proportions instead of that compact variant. */
-  --dv-tabs-and-actions-container-height: 35px;
-  --dv-tabs-and-actions-container-font-size: 13px;
+  --dv-tabs-and-actions-container-height: var(--top-pane-height);
+  --dv-tabs-and-actions-container-font-size: 12px;
+  --dv-tab-font-size: 12px;
   height: 100%;
   width: 100%;
 }
@@ -389,6 +396,7 @@ body.resizing-sidebar .sidebar-resize-handle {
    is needed to beat the theme's own active/inactive tab background rules,
    which are more specific than a plain .dv-tab:hover selector. */
 .dv-vault-theme .dv-tab {
+  padding-inline: 8px;
   transition: background-color 0.12s ease;
 }
 .dv-vault-theme .dv-tab:hover {
@@ -476,8 +484,8 @@ body.resizing-sidebar .sidebar-resize-handle {
 .attachment-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  padding: 8px 20px 0;
+  gap: 5px;
+  padding: 6px 16px 10px;
 }
 
 .attachment-chip {
@@ -509,21 +517,25 @@ body.resizing-sidebar .sidebar-resize-handle {
 }
 
 .attachment-chip-name {
-  font-size: 0.78em;
+  font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .attachment-chip-size {
-  font-size: 0.68em;
+  font-size: 10px;
   color: var(--text-2);
 }
 
 .attachment-chip-action {
-  width: 32px;
-  height: 32px;
+  width: 26px;
+  height: 26px;
   flex-shrink: 0;
+}
+.attachment-chip-action .lucide {
+  width: 16px;
+  height: 16px;
 }
 .attachment-chip-action:hover {
   background-color: var(--border);
@@ -651,7 +663,7 @@ body.ctrl-pressed .link-anchor {
 
 .search-bar {
   position: relative;
-  padding: 6px;
+  padding: 3px 6px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -663,15 +675,16 @@ body.ctrl-pressed .link-anchor {
 
 .search-input-wrap svg {
   position: absolute;
-  left: 11px;
+  left: 9px;
   color: var(--text-2);
   pointer-events: none;
 }
 
 .search-input {
   width: 100%;
-  padding: 0.6em 0.8em 0.6em 2.2em;
-  font-size: 0.95em;
+  height: 34px;
+  padding: 0 0.7em 0 1.9em;
+  font-size: 0.82em;
   background-color: var(--bg-1);
 }
 
@@ -745,15 +758,20 @@ body.ctrl-pressed .link-anchor {
 .tree-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin: 1px 0;
-  padding: 6px 10px;
+  gap: 4px;
+  margin: 0;
+  padding: 3px 5px;
   border-radius: 6px;
   cursor: pointer;
   user-select: none;
   white-space: nowrap;
   color: var(--text-0);
   transition: background-color 0.12s;
+}
+
+.tree-row .lucide {
+  width: 16px;
+  height: 16px;
 }
 
 .tree-row:hover {
@@ -781,13 +799,13 @@ body.ctrl-pressed .link-anchor {
 .tree-name {
   overflow: hidden;
   text-overflow: ellipsis;
-  font-size: 0.82em;
+  font-size: 13px;
   font-weight: 400;
 }
 
 .tree-name-input {
   padding: 0 4px;
-  font-size: 0.82em;
+  font-size: 13px;
 }
 
 .tree-lock-group {

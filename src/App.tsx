@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { FolderPlus, FolderOpen, FileText, X } from "lucide-react";
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent } from "dockview-react";
 import { useVaultStore } from "./store/vaultStore";
-import { useZoomStore } from "./store/zoomStore";
+import { useZoomStore, type ZoomScope } from "./store/zoomStore";
 import { useUiStore } from "./store/uiStore";
 import { Sidebar } from "./components/Sidebar";
 import { PasswordPrompt } from "./components/PasswordPrompt";
@@ -46,26 +46,38 @@ function App() {
   const syncPath = useVaultStore((s) => s.syncPath);
   const sidebarCollapsed = useUiStore((s) => s.sidebarCollapsed);
 
-  const uiZoom = useZoomStore((s) => s.uiZoom);
+  const sidebarZoom = useZoomStore((s) => s.sidebarZoom);
+  const chromeZoom = useZoomStore((s) => s.chromeZoom);
   const zoomIn = useZoomStore((s) => s.zoomIn);
   const zoomOut = useZoomStore((s) => s.zoomOut);
   const zoomReset = useZoomStore((s) => s.zoomReset);
 
   const dockviewApiRef = useRef<DockviewApi | null>(null);
+  const lastZoomScopeRef = useRef<ZoomScope>("chrome");
   const restoredForPathRef = useRef<string | null>(null);
   const layoutSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Closes any open tab (primary or duplicate) whose file no longer exists in
-  // the tree — covers deletes, and moves that changed nothing id-wise so it's
-  // a no-op for those. Safe to call anytime the tree changes.
-  function pruneStalePanels() {
+  // Keeps every open panel in sync with the tree. Deleted files lose their
+  // panels, while renames update both primary and duplicate tab titles and
+  // the filename passed to their editor components.
+  function syncPanelsToTree() {
     const api = dockviewApiRef.current;
     const currentVault = useVaultStore.getState().vault;
     if (!api || !currentVault) return;
-    const validIds = new Set(flattenTree(currentVault.tree).map((n) => n.id));
+    const nodesById = new Map(flattenTree(currentVault.tree).map((node) => [node.id, node]));
     for (const panel of api.panels) {
       const params = panel.params as NotePanelParams;
-      if (!validIds.has(params.fileId)) panel.api.close();
+      const node = nodesById.get(params.fileId);
+      if (!node) {
+        panel.api.close();
+        continue;
+      }
+
+      const title = params.mirror ? `${node.name} — Copy` : node.name;
+      if (panel.api.title !== title) panel.api.setTitle(title);
+      if (params.fileName !== node.name) {
+        panel.api.updateParameters({ ...params, fileName: node.name });
+      }
     }
   }
 
@@ -107,14 +119,14 @@ function App() {
         console.error("Failed to restore previous tab layout, starting empty:", e);
         api.clear();
       }
-      pruneStalePanels();
+      syncPanelsToTree();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [syncPath]);
 
   useEffect(() => {
     if (!vault) return;
-    pruneStalePanels();
+    syncPanelsToTree();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vault?.tree]);
 
@@ -170,7 +182,7 @@ function App() {
       const isReset = e.key === "0" || e.code === "Numpad0";
       if (!isZoomIn && !isZoomOut && !isReset) return;
       e.preventDefault();
-      const scope = (e.target as HTMLElement | null)?.closest?.(".editor-content") ? "editor" : "ui";
+      const scope = lastZoomScopeRef.current;
       if (isZoomIn) zoomIn(scope);
       else if (isZoomOut) zoomOut(scope);
       else zoomReset(scope);
@@ -178,6 +190,15 @@ function App() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [zoomIn, zoomOut, zoomReset]);
+
+  function rememberZoomScope(target: EventTarget | null) {
+    if (!(target instanceof Element)) return;
+    lastZoomScopeRef.current = target.closest(".sidebar")
+      ? "sidebar"
+      : target.closest(".editor-content")
+        ? "editor"
+        : "chrome";
+  }
 
   const passwordPromptProps = (() => {
     if (!pending) return null;
@@ -198,7 +219,7 @@ function App() {
   if (!vault) {
     return (
       <div className="zoom-viewport">
-        <main className="container" style={{ zoom: uiZoom }}>
+        <main className="container" style={{ zoom: chromeZoom }}>
           <h1>Vault Notes</h1>
           <div className="row">
             <button className="primary" onClick={newVault}>
@@ -241,9 +262,13 @@ function App() {
 
   return (
     <div className="zoom-viewport">
-      <div className="app-shell" style={{ zoom: uiZoom }}>
-        <Sidebar onOpenFile={openFile} />
-        <main className={`main-area${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
+      <div
+        className="app-shell"
+        onPointerDownCapture={(e) => rememberZoomScope(e.target)}
+        onFocusCapture={(e) => rememberZoomScope(e.target)}
+      >
+        <Sidebar onOpenFile={openFile} zoomScale={sidebarZoom} />
+        <main className={`main-area${sidebarCollapsed ? " sidebar-collapsed" : ""}`} style={{ zoom: chromeZoom }}>
           <div className="main-body">
             {error && (
             <div className="error-banner" role="alert">

@@ -63,7 +63,7 @@ export function TreeView({
       onSelect={(selected) => onSelect?.(selected.map((n) => n.data))}
       onActivate={(node) => onOpen?.(node.data)}
       width="100%"
-      rowHeight={32}
+      rowHeight={28}
     >
       {(rowProps) => (
         <NodeRow
