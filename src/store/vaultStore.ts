@@ -60,6 +60,8 @@ const BACKUP_SUFFIX = ".backup";
 // that was just added). Track in-flight saves per id so loads and later
 // saves for that id can wait for them to actually commit first.
 const pendingContentSaves = new Map<string, Promise<void>>();
+let historyNeedsCheckpoint = false;
+let exitFlushInFlight: Promise<void> | null = null;
 
 type PendingAction =
   | { kind: "vault-create"; path: string }
@@ -280,6 +282,7 @@ async function finalizeVaultOpen(
   raw: VaultFile | LegacyVaultFile,
   legacy: boolean,
 ): Promise<void> {
+  historyNeedsCheckpoint = false;
   const vault = legacy ? await migrateLegacyVault(livePath, raw as LegacyVaultFile) : (raw as VaultFile);
 
   // Best-effort safety net: one full copy per open, not per edit, so a corrupt
@@ -353,6 +356,7 @@ async function checkpointOpenVault(
   set: (partial: Partial<VaultState>) => void,
   reason: string,
   compactAndPublish: boolean,
+  publishWithoutCompaction = false,
 ): Promise<void> {
   const { flushAllDirtyNotes } = await import("../editor/noteModel");
   await flushAllDirtyNotes();
@@ -365,12 +369,18 @@ async function checkpointOpenVault(
     await writeVaultHeader(filePath, await serializeVault(vault));
     set({ vault, dirty: false });
   }
+  const shouldCheckpoint = historyNeedsCheckpoint || compactAndPublish;
   if (compactAndPublish) {
     vault = await compactVaultInPlace(vault, filePath);
     set({ vault, dirty: false });
     await copyFileAtomic(filePath, syncPath);
+  } else if (publishWithoutCompaction && historyNeedsCheckpoint) {
+    await copyFileAtomic(filePath, syncPath);
   }
-  await historyCheckpoint(syncPath, filePath, reason);
+  if (shouldCheckpoint) {
+    await historyCheckpoint(syncPath, filePath, reason);
+    historyNeedsCheckpoint = false;
+  }
 }
 
 function clearOpenVault(set: (partial: Partial<VaultState>) => void, error: string | null = null) {
@@ -708,7 +718,16 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   flushForExit: async () => {
     if (!get().vault) return;
     cancelScheduledPublish();
-    await checkpointOpenVault(get, set, "Application closed", true);
+    if (!exitFlushInFlight) {
+      // Closing is not a maintenance operation. Compaction rewrites every
+      // live blob and can take a long time; Save As and explicit vault lock
+      // still compact, while ordinary close only flushes changed bytes,
+      // publishes them, and checkpoints history.
+      exitFlushInFlight = checkpointOpenVault(get, set, "Application closed", false, true).finally(() => {
+        exitFlushInFlight = null;
+      });
+    }
+    await exitFlushInFlight;
   },
 
   setSelection: (ids) => set({ selectedIds: ids }),
@@ -1138,6 +1157,7 @@ const AUTOSAVE_DEBOUNCE_MS = 800;
 let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
 useVaultStore.subscribe((state) => {
   if (!state.dirty || !state.vault || !state.filePath) return;
+  historyNeedsCheckpoint = true;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   autosaveTimer = setTimeout(() => {
     useVaultStore.getState().saveVault();

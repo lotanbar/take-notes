@@ -1,6 +1,4 @@
 import { useEffect, useRef } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { confirm } from "@tauri-apps/plugin-dialog";
 import { FolderPlus, FolderOpen, FileText, X } from "lucide-react";
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent } from "dockview-react";
 import { useVaultStore } from "./store/vaultStore";
@@ -36,7 +34,6 @@ function App() {
   const newVault = useVaultStore((s) => s.newVault);
   const openVault = useVaultStore((s) => s.openVault);
   const tryAutoOpenLastVault = useVaultStore((s) => s.tryAutoOpenLastVault);
-  const flushForExit = useVaultStore((s) => s.flushForExit);
   const submitPassword = useVaultStore((s) => s.submitPassword);
   const cancelPassword = useVaultStore((s) => s.cancelPassword);
   const clearError = useVaultStore((s) => s.clearError);
@@ -162,48 +159,6 @@ function App() {
     if (didAutoOpen.current) return;
     didAutoOpen.current = true;
     tryAutoOpenLastVault();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // "Just close the window" is the other half of never touching Save As
-  // (the other being lockVault, see vaultStore.ts): intercept the close
-  // request to compact in place first, then destroy() the window ourselves.
-  // Must be destroy(), not close(): close() just emits another
-  // closeRequested event (recursing back into this same handler), where
-  // destroy() actually tears the window down without round-tripping through
-  // JS again. And the destroy() has to run in `finally` -- if it only ran
-  // after a successful flushForExit(), any error there (e.g. the close
-  // command itself being denied) would throw out of this handler, and since
-  // preventDefault() already ran, the window's onCloseRequested wrapper has
-  // no fallback of its own: the window would be stuck unclosable with no
-  // visible error.
-  useEffect(() => {
-    const win = getCurrentWindow();
-    const unlistenPromise = win.onCloseRequested(async (event) => {
-      event.preventDefault();
-      await win.hide();
-      for (;;) {
-        try {
-          await flushForExit();
-          await win.destroy();
-          break;
-        } catch (e) {
-          await win.show();
-          const retry = await confirm(
-            `The final recovery-history checkpoint failed:\n\n${String(e)}\n\nRetry, or use Emergency Exit to close without a final backup.`,
-            { title: "Vault history failure", kind: "warning", okLabel: "Retry", cancelLabel: "Emergency Exit" },
-          );
-          if (!retry) {
-            await win.destroy();
-            break;
-          }
-          await win.hide();
-        }
-      }
-    });
-    return () => {
-      unlistenPromise.then((unlisten) => unlisten());
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

@@ -133,10 +133,14 @@ fn maybe_pack(repo: &Repository) {
 
 fn preserve_invalid(path: &Path) -> Result<(), String> {
     if !path.exists() { return Ok(()); }
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs();
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let preserved = path.with_file_name(format!("{name}.preserved-{stamp}"));
-    fs::rename(path, preserved).map_err(|e| format!("preserving invalid history failed: {e}"))
+    for suffix in 0..1000u16 {
+        let preserved = path.with_file_name(format!("{name}.preserved-{stamp}-{suffix}"));
+        if preserved.exists() { continue; }
+        return fs::rename(path, preserved).map_err(|e| format!("preserving invalid history failed: {e}"));
+    }
+    Err("preserving invalid history failed: could not allocate a unique destination".into())
 }
 
 fn unix_timestamp() -> Result<i64, String> {
@@ -198,16 +202,26 @@ pub async fn history_initialize(app: tauri::AppHandle, source_path: String, vaul
 fn history_initialize_blocking(app: tauri::AppHandle, source_path: String, vault_path: String) -> Result<HistoryStatus, String> {
     let _guard = HISTORY_LOCK.get_or_init(|| Mutex::new(())).lock().map_err(|_| "history lock poisoned".to_string())?;
     let (primary, mirror) = app_history_dirs(&app, &source_path)?;
+    let existing = inspect_pair(&primary, &mirror, &source_path);
+    if existing.status == "ready" {
+        return Ok(existing);
+    }
     if inspect(&primary, &source_path).status != "ready" {
-        preserve_invalid(&primary)?;
-        fs::create_dir_all(&primary).map_err(|e| e.to_string())?;
-        make_private(primary.parent().unwrap_or(&primary))?;
-        make_private(&primary)?;
-        let repo = Repository::init(&primary).map_err(|e| e.to_string())?;
-        fs::write(primary.join(SOURCE_FILE), format!("{}\n", normalized_source(&source_path))).map_err(|e| e.to_string())?;
-        fs::write(primary.join(RECOVERY_FILE), "# Vault recovery\n\nEach Git revision of `vault.vlt` is a complete encrypted vault snapshot. To recover, check out the desired revision and copy `vault.vlt` to the source path recorded in `SOURCE_PATH.txt`. Keep the original file until recovery is verified.\n").map_err(|e| e.to_string())?;
-        atomic_copy(Path::new(&vault_path), &primary.join(VAULT_FILE))?;
-        commit(&repo, "Initial vault backup", unix_timestamp()?)?;
+        if inspect(&mirror, &source_path).status == "ready" {
+            // The whole point of the mirror is that either side can rebuild
+            // the other without throwing away its history.
+            seed_mirror(&mirror, &primary)?;
+        } else {
+            preserve_invalid(&primary)?;
+            fs::create_dir_all(&primary).map_err(|e| e.to_string())?;
+            make_private(primary.parent().unwrap_or(&primary))?;
+            make_private(&primary)?;
+            let repo = Repository::init(&primary).map_err(|e| e.to_string())?;
+            fs::write(primary.join(SOURCE_FILE), format!("{}\n", normalized_source(&source_path))).map_err(|e| e.to_string())?;
+            fs::write(primary.join(RECOVERY_FILE), "# Vault recovery\n\nEach Git revision of `vault.vlt` is a complete encrypted vault snapshot. To recover, check out the desired revision and copy `vault.vlt` to the source path recorded in `SOURCE_PATH.txt`. Keep the original file until recovery is verified.\n").map_err(|e| e.to_string())?;
+            atomic_copy(Path::new(&vault_path), &primary.join(VAULT_FILE))?;
+            commit(&repo, "Initial vault backup", unix_timestamp()?)?;
+        }
     }
     seed_mirror(&primary, &mirror)?;
     let status = inspect_pair(&primary, &mirror, &source_path);
@@ -326,6 +340,21 @@ mod tests {
         assert_eq!(inspect_pair(&primary_path, &mirror_path, &source.to_string_lossy()).status, "ready");
         drop(primary);
         drop(mirror);
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn preserving_twice_never_reuses_a_directory_name() {
+        let parent = temp_dir("preserve");
+        let target = parent.join("history");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("first"), b"one").unwrap();
+        preserve_invalid(&target).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("second"), b"two").unwrap();
+        preserve_invalid(&target).unwrap();
+        let preserved = fs::read_dir(&parent).unwrap().count();
+        assert_eq!(preserved, 2);
         fs::remove_dir_all(&parent).unwrap();
     }
 }

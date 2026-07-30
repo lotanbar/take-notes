@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "vault-notes-app"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "base64 0.22.1",
  "git2",
