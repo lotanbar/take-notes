@@ -153,6 +153,12 @@ function notifyInlineImages(state: NoteModelState): void {
   for (const listener of state.inlineImageListeners) listener();
 }
 
+function persistentInlineImages(state: NoteModelState): InlineImage[] {
+  return getInlineImages(state).map((image) =>
+    image.pendingOptimization ? { ...image, data: "", pendingOptimization: true } : image,
+  );
+}
+
 export function subscribeInlineImages(state: NoteModelState, listener: () => void): () => void {
   state.inlineImageListeners.add(listener);
   return () => state.inlineImageListeners.delete(listener);
@@ -179,7 +185,39 @@ export function setInlineImages(state: NoteModelState, images: InlineImage[]): v
 
 export function addInlineImage(state: NoteModelState, image: InlineImage): void {
   setInlineImages(state, [...getInlineImages(state), image]);
-  state.latestContent = { ...state.latestContent, inlineImages: getInlineImages(state) };
+  state.latestContent = { ...state.latestContent, inlineImages: persistentInlineImages(state) };
+  scheduleFlush(state);
+}
+
+export function replaceInlineImage(
+  state: NoteModelState,
+  id: string,
+  replacement: Pick<InlineImage, "mimeType" | "size" | "data">,
+): boolean {
+  const image = state.inlineImages.find((candidate) => candidate.id === id);
+  if (!image) return false;
+  image.mimeType = replacement.mimeType;
+  image.size = replacement.size;
+  image.data = replacement.data;
+  delete image.pendingOptimization;
+  state.latestContent = { ...state.latestContent, inlineImages: persistentInlineImages(state) };
+  notifyInlineImages(state);
+  scheduleFlush(state);
+  return true;
+}
+
+export function hydratePendingInlineImage(state: NoteModelState, source: InlineImage): void {
+  const existing = state.inlineImages.find((candidate) => candidate.id === source.id);
+  if (existing) {
+    existing.mimeType = source.mimeType;
+    existing.size = source.size;
+    existing.data = source.data;
+    existing.pendingOptimization = true;
+    notifyInlineImages(state);
+    return;
+  }
+  setInlineImages(state, [...getInlineImages(state), { ...source, pendingOptimization: true }]);
+  state.latestContent = { ...state.latestContent, inlineImages: persistentInlineImages(state) };
   scheduleFlush(state);
 }
 
@@ -194,7 +232,7 @@ export function updateInlineImageSize(
   if (!image) return;
   image.width = Math.max(80, Math.round(width));
   image.height = Math.max(60, Math.round(height));
-  state.latestContent = { ...state.latestContent, inlineImages: getInlineImages(state) };
+  state.latestContent = { ...state.latestContent, inlineImages: persistentInlineImages(state) };
   scheduleFlush(state);
   if (notify) notifyInlineImages(state);
 }
@@ -202,7 +240,12 @@ export function updateInlineImageSize(
 export function removeInlineImage(state: NoteModelState, id: string): void {
   const images = getInlineImages(state).filter((image) => image.id !== id);
   setInlineImages(state, images);
-  state.latestContent = { ...state.latestContent, inlineImages: images };
+  state.latestContent = {
+    ...state.latestContent,
+    inlineImages: images.map((image) =>
+      image.pendingOptimization ? { ...image, data: "", pendingOptimization: true } : image,
+    ),
+  };
   scheduleFlush(state);
 }
 
@@ -302,7 +345,7 @@ function handleContentChange(state: NoteModelState) {
     bookmarks: nextBookmarks,
     links: nextLinks,
     attachments: state.attachments,
-    inlineImages: getInlineImages(state),
+    inlineImages: persistentInlineImages(state),
   };
   notifyInlineImages(state);
   scheduleFlush(state);

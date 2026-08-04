@@ -1,10 +1,15 @@
 mod attachment_watch;
 mod attachments;
-mod vault;
-mod history;
 mod clipboard;
+mod history;
+mod image_optimization;
+mod vault;
 
 use tauri::Manager;
+
+pub fn run_image_worker_from_args() -> Option<i32> {
+    image_optimization::run_worker_from_args()
+}
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -39,6 +44,12 @@ pub fn run() {
             history::history_initialize,
             history::history_checkpoint,
             clipboard::read_native_clipboard,
+            image_optimization::optimize_inline_image,
+            image_optimization::cancel_inline_image_optimization,
+            image_optimization::pending_image_write,
+            image_optimization::pending_image_list,
+            image_optimization::pending_image_read,
+            image_optimization::pending_image_delete,
             attachments::write_temp_attachment,
             attachments::save_attachment_to_path,
             attachment_watch::start_attachment_watch,

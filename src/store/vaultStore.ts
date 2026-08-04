@@ -255,6 +255,8 @@ interface VaultState {
   // runExclusive in the implementation for the ordering guarantee this gives.
   saveNodeContentRaw: (id: string, content: NodeContent) => Promise<void>;
   runExclusive: <T>(id: string, work: () => Promise<T>) => Promise<T>;
+  protectPendingImage: (id: string, plaintext: string) => Promise<string>;
+  unprotectPendingImage: (id: string, ciphertext: string) => Promise<string>;
 
   openFile: (node: TreeNode) => Promise<void>;
   navigateToBookmark: (targetBookmarkId: string) => Promise<void>;
@@ -976,6 +978,34 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   },
 
   saveNodeContent: (id, content) => get().runExclusive(id, () => get().saveNodeContentRaw(id, content)),
+
+  protectPendingImage: async (id, plaintext) => {
+    const { vault, masterKey, nodeKeys } = get();
+    if (!vault || !masterKey) throw new Error("The vault is locked.");
+    const node = findNode(vault.tree, id);
+    if (!node) throw new Error("The screenshot's note no longer exists.");
+    let payload = await encryptToB64(masterKey, plaintext);
+    if (node.locked) {
+      const nodeKey = nodeKeys.get(id);
+      if (!nodeKey) throw new Error("Unlock the note before optimizing its screenshots.");
+      payload = await encryptToB64(nodeKey, payload);
+    }
+    return payload;
+  },
+
+  unprotectPendingImage: async (id, ciphertext) => {
+    const { vault, masterKey, nodeKeys } = get();
+    if (!vault || !masterKey) throw new Error("The vault is locked.");
+    const node = findNode(vault.tree, id);
+    if (!node) throw new Error("The screenshot's note no longer exists.");
+    let payload = ciphertext;
+    if (node.locked) {
+      const nodeKey = nodeKeys.get(id);
+      if (!nodeKey) throw new Error("Unlock the note before resuming its screenshots.");
+      payload = await decryptFromB64(nodeKey, payload);
+    }
+    return decryptFromB64(masterKey, payload);
+  },
 
   openFile: async (node) => {
     const { sessionUnlockedIds } = get();

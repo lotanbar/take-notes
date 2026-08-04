@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FolderPlus, FolderOpen, FileText, X } from "lucide-react";
 import { DockviewReact, type DockviewApi, type DockviewReadyEvent } from "dockview-react";
 import { useVaultStore } from "./store/vaultStore";
@@ -10,6 +11,12 @@ import { ConfirmDialog } from "./components/ConfirmDialog";
 import { EditorPanel, type NotePanelParams } from "./components/EditorPanel";
 import { findNode, flattenTree } from "./lib/treeOps";
 import { loadLayout, saveLayout } from "./lib/sessionStore";
+import {
+  getInlineImageOptimizationSnapshot,
+  initializeInlineImageOptimizations,
+  subscribeInlineImageOptimizations,
+  waitForInlineImageOptimizations,
+} from "./editor/inlineImageOptimization";
 import "dockview-react/dist/styles/dockview.css";
 import "./App.css";
 
@@ -56,6 +63,38 @@ function App() {
   const lastZoomScopeRef = useRef<ZoomScope>("chrome");
   const restoredForPathRef = useRef<string | null>(null);
   const layoutSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closeProceedingRef = useRef(false);
+  const [showOptimizationCloseWarning, setShowOptimizationCloseWarning] = useState(false);
+  const [waitingForOptimizations, setWaitingForOptimizations] = useState(false);
+  const optimizationSnapshot = useSyncExternalStore(
+    subscribeInlineImageOptimizations,
+    getInlineImageOptimizationSnapshot,
+    getInlineImageOptimizationSnapshot,
+  );
+
+  async function finishClose(): Promise<void> {
+    if (closeProceedingRef.current) return;
+    closeProceedingRef.current = true;
+    setShowOptimizationCloseWarning(false);
+    try {
+      await useVaultStore.getState().flushForExit();
+      await getCurrentWindow().destroy();
+    } catch (closeError) {
+      closeProceedingRef.current = false;
+      useVaultStore.setState({ error: `The app could not finish saving before close: ${String(closeError)}` });
+    }
+  }
+
+  async function waitAndClose(): Promise<void> {
+    setWaitingForOptimizations(true);
+    try {
+      await waitForInlineImageOptimizations();
+      await finishClose();
+    } catch (optimizationError) {
+      useVaultStore.setState({ error: String(optimizationError) });
+      setWaitingForOptimizations(false);
+    }
+  }
 
   // Keeps every open panel in sync with the tree. Deleted files lose their
   // panels, while renames update both primary and duplicate tab titles and
@@ -171,6 +210,32 @@ function App() {
     if (didAutoOpen.current) return;
     didAutoOpen.current = true;
     tryAutoOpenLastVault();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    void initializeInlineImageOptimizations(vault?.salt ?? null).catch((optimizationError) => {
+      console.error("Could not initialize screenshot optimization:", optimizationError);
+    });
+  }, [vault?.salt, sessionUnlockedIds]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWindow().onCloseRequested((event) => {
+      if (closeProceedingRef.current) return;
+      event.preventDefault();
+      if (getInlineImageOptimizationSnapshot().pendingCount > 0) {
+        setShowOptimizationCloseWarning(true);
+        return;
+      }
+      void finishClose();
+    }).then((stop) => {
+      unlisten = stop;
+    });
+    return () => unlisten?.();
+    // Installed once; the handler reads current stores/snapshots directly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -313,6 +378,19 @@ function App() {
             error={passwordError}
             onSubmit={submitPassword}
             onCancel={cancelPassword}
+          />
+        )}
+        {showOptimizationCloseWarning && (
+          <ConfirmDialog
+            title="Screenshots are still optimizing"
+            message={`${optimizationSnapshot.pendingCount} screenshot${optimizationSnapshot.pendingCount === 1 ? " is" : "s are"} still being optimized. You can wait, or quit safely and resume next time.`}
+            actions={[
+              { label: "Quit and resume later", onClick: () => void finishClose() },
+              { label: waitingForOptimizations ? "Waiting…" : "Wait and close", onClick: () => void waitAndClose() },
+            ]}
+            onCancel={() => {
+              if (!waitingForOptimizations) setShowOptimizationCloseWarning(false);
+            }}
           />
         )}
       </div>

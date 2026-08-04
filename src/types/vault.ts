@@ -69,6 +69,10 @@ export interface InlineImage {
   at: number; // text offset whose line the image is displayed after
   width: number;
   height: number;
+  // A durable, data-less placeholder while the full original waits in the
+  // encrypted local optimization spool. Runtime views replace `data` from
+  // that spool; the large source image never enters the append-only vault.
+  pendingOptimization?: boolean;
 }
 
 export interface BookmarkRange {

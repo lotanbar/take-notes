@@ -15,6 +15,7 @@ import {
   type NoteModelState,
 } from "../editor/noteModel";
 import { clipboardImageFiles, mountInlineImageView, pasteInlineImages, pasteNativeClipboard } from "../editor/inlineImages";
+import { activateInlineImageOptimizations } from "../editor/inlineImageOptimization";
 import { useVaultStore } from "../store/vaultStore";
 import { useZoomStore } from "../store/zoomStore";
 import { isLinkBroken } from "../lib/bookmarkOps";
@@ -363,6 +364,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
           noteState.prevBookmarkWidths = new Map();
           noteState.latestContent = { text: model.getValue(), bookmarks: [], links: [], attachments, inlineImages };
           noteState.loaded = true;
+          activateInlineImageOptimizations(noteState);
           refreshRtlLineDecorations(editor, model);
           refreshToolbarState();
           return;
@@ -393,6 +395,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
         noteState.prevBookmarkWidths = new Map(content.bookmarks.map((b) => [b.bookmarkId, b.to - b.from]));
         noteState.latestContent = content;
         noteState.loaded = true;
+        activateInlineImageOptimizations(noteState);
         refreshRtlLineDecorations(editor, model);
 
         const targetBookmarkId = useVaultStore.getState().activeBookmarkId;
@@ -424,6 +427,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
       // reuse the existing shared state as-is (no content load needed).
       setAttachments(noteState.attachments);
       if (noteState.loaded) {
+        activateInlineImageOptimizations(noteState);
         refreshRtlLineDecorations(editor, noteState.model);
         refreshToolbarState();
       }

@@ -3,13 +3,18 @@ import { detectDirection } from "../lib/textDirection";
 import { MAX_ATTACHMENT_BYTES } from "../lib/attachmentOps";
 import type { InlineImage } from "../types/vault";
 import {
-  addInlineImage,
   getInlineImages,
   removeInlineImage,
   subscribeInlineImages,
   updateInlineImageSize,
   type NoteModelState,
 } from "./noteModel";
+import {
+  cancelInlineImageOptimization,
+  getInlineImageOptimizationStatus,
+  stageInlineImageOptimization,
+  subscribeInlineImageOptimizations,
+} from "./inlineImageOptimization";
 import { monaco } from "./monacoSetup";
 
 const DEFAULT_MAX_WIDTH = 640;
@@ -168,10 +173,22 @@ export function mountInlineImageView(
         frames.set(inlineImage.id, frame);
 
         const image = document.createElement("img");
-        image.src = `data:${inlineImage.mimeType};base64,${inlineImage.data}`;
+        if (inlineImage.data) image.src = `data:${inlineImage.mimeType};base64,${inlineImage.data}`;
         image.alt = "Pasted screenshot";
         image.draggable = false;
         frame.appendChild(image);
+
+        const optimizationStatus = getInlineImageOptimizationStatus(inlineImage.id);
+        if (optimizationStatus) {
+          const progress = document.createElement("div");
+          progress.className = `inline-image-progress inline-image-progress-${optimizationStatus}`;
+          progress.setAttribute("role", "progressbar");
+          progress.setAttribute("aria-label", optimizationStatus === "failed" ? "Screenshot optimization paused" : "Optimizing screenshot");
+          progress.title = optimizationStatus === "failed"
+            ? "Optimization paused; it will retry when the vault is reopened"
+            : "Optimizing screenshot";
+          frame.appendChild(progress);
+        }
 
         alignment.appendChild(frame);
         zone.appendChild(alignment);
@@ -313,16 +330,19 @@ export function mountInlineImageView(
     event.stopImmediatePropagation();
     const removingId = selectedId;
     selectedId = null;
+    void cancelInlineImageOptimization(state.fileId, removingId);
     removeInlineImage(state, removingId);
     editor.focus();
   };
   editorDomNode?.addEventListener("keydown", handleSelectedImageKey, true);
+  const unsubscribeOptimization = subscribeInlineImageOptimizations(render);
   render();
   return {
     render,
     dispose() {
       disposed = true;
       unsubscribe();
+      unsubscribeOptimization();
       editorMouseSubscription.dispose();
       editorDomNode?.removeEventListener("keydown", handleSelectedImageKey, true);
       clearZones();
@@ -339,7 +359,7 @@ export async function pasteInlineImages(
   const position = editor.getPosition();
   if (!position) return;
   const at = state.model.getOffsetAt(position);
-  for (const file of files) addInlineImage(state, await fileToInlineImage(file, at));
+  for (const file of files) await stageInlineImageOptimization(state, await fileToInlineImage(file, at));
 }
 
 export async function pasteNativeClipboard(
@@ -352,7 +372,7 @@ export async function pasteNativeClipboard(
     const position = editor.getPosition();
     if (!position) return;
     const size = displaySize(clipboard.image.width, clipboard.image.height);
-    addInlineImage(state, {
+    await stageInlineImageOptimization(state, {
       id: crypto.randomUUID(),
       mimeType: clipboard.image.mimeType,
       size: clipboard.image.size,

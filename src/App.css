@@ -505,6 +505,44 @@ body.resizing-sidebar .sidebar-resize-handle {
   user-select: none;
 }
 
+.inline-image-progress {
+  position: absolute;
+  right: 1px;
+  bottom: 1px;
+  left: 1px;
+  z-index: 1;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 0 0 3px 3px;
+  background: color-mix(in srgb, #3b82f6 20%, transparent);
+  pointer-events: none;
+}
+
+.inline-image-progress::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  width: 35%;
+  border-radius: inherit;
+  background: #3b82f6;
+  animation: inline-image-optimization 1.1s ease-in-out infinite;
+}
+
+.inline-image-progress-failed {
+  background: color-mix(in srgb, #ef4444 22%, transparent);
+}
+
+.inline-image-progress-failed::after {
+  width: 100%;
+  background: #ef4444;
+  animation: none;
+}
+
+@keyframes inline-image-optimization {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(320%); }
+}
+
 .inline-image-frame.inline-image-selected {
   border-color: #3b82f6;
   box-shadow: 0 0 0 1px #3b82f6;

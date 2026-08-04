@@ -38,9 +38,11 @@ export function writeVaultHeader(path: string, headerJson: string): Promise<void
 }
 
 export function readVaultBlob(path: string, ref: ContentRef): Promise<string> {
-  return enqueue(() =>
-    invoke<string>("read_vault_blob", { path, payloadOffset: ref.payloadOffset, length: ref.length }),
-  );
+  // Published blob references point to immutable append-only regions. Reading
+  // one cannot race an append: the new reference is exposed only after that
+  // append completes. Keep reads outside the write/copy/history queue so note
+  // loading never waits behind a large image save or whole-vault cloud copy.
+  return invoke<string>("read_vault_blob", { path, payloadOffset: ref.payloadOffset, length: ref.length });
 }
 
 export function vaultCreateFresh(path: string): Promise<void> {
