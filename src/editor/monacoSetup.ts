@@ -83,35 +83,44 @@ export function watchThemeChanges(onChange: (theme: string) => void): () => void
 // whitespace-only line is cleared instead of growing, selections just insert
 // a plain newline.
 export function registerIndentCarryingEnter(editor: monaco.editor.IStandaloneCodeEditor) {
-  editor.addCommand(monaco.KeyCode.Enter, () => {
-    const model = editor.getModel();
-    const selection = editor.getSelection();
-    if (!model || !selection) return;
+  // addCommand() registers against Monaco's shared keybinding service, so the
+  // most recently created pane would handle Enter even when another pane had
+  // focus. addAction() automatically adds this editor's id as a precondition.
+  editor.addAction({
+    id: `vault-notes.indent-enter.${editor.getId()}`,
+    label: "Insert Line Break",
+    keybindings: [monaco.KeyCode.Enter],
+    keybindingContext: "editorTextFocus",
+    run: (activeEditor) => {
+      const model = activeEditor.getModel();
+      const selection = activeEditor.getSelection();
+      if (!model || !selection) return;
 
-    if (!selection.isEmpty()) {
-      editor.executeEdits("indent-enter", [{ range: selection, text: "\n" }]);
-      return;
-    }
-
-    const lineNumber = selection.positionLineNumber;
-    const lineContent = model.getLineContent(lineNumber);
-
-    if (/^\s*$/.test(lineContent)) {
-      if (lineContent.length === 0) {
-        editor.executeEdits("indent-enter", [{ range: selection, text: "\n" }]);
-        editor.setPosition({ lineNumber: lineNumber + 1, column: 1 });
+      if (!selection.isEmpty()) {
+        activeEditor.executeEdits("indent-enter", [{ range: selection, text: "\n" }]);
         return;
       }
-      const range = new monaco.Range(lineNumber, 1, lineNumber, lineContent.length + 1);
-      editor.executeEdits("indent-enter", [{ range, text: "" }]);
-      editor.setPosition({ lineNumber, column: 1 });
-      return;
-    }
 
-    const leading = (lineContent.match(/^ */) || [""])[0];
-    editor.executeEdits("indent-enter", [{ range: selection, text: `\n${leading}` }]);
-    editor.setPosition({ lineNumber: lineNumber + 1, column: leading.length + 1 });
-  }, "editorTextFocus");
+      const lineNumber = selection.positionLineNumber;
+      const lineContent = model.getLineContent(lineNumber);
+
+      if (/^\s*$/.test(lineContent)) {
+        if (lineContent.length === 0) {
+          activeEditor.executeEdits("indent-enter", [{ range: selection, text: "\n" }]);
+          activeEditor.setPosition({ lineNumber: lineNumber + 1, column: 1 });
+          return;
+        }
+        const range = new monaco.Range(lineNumber, 1, lineNumber, lineContent.length + 1);
+        activeEditor.executeEdits("indent-enter", [{ range, text: "" }]);
+        activeEditor.setPosition({ lineNumber, column: 1 });
+        return;
+      }
+
+      const leading = (lineContent.match(/^ */) || [""])[0];
+      activeEditor.executeEdits("indent-enter", [{ range: selection, text: `\n${leading}` }]);
+      activeEditor.setPosition({ lineNumber: lineNumber + 1, column: leading.length + 1 });
+    },
+  });
 }
 
 export { monaco };

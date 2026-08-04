@@ -2,6 +2,9 @@ mod attachment_watch;
 mod attachments;
 mod vault;
 mod history;
+mod clipboard;
+
+use tauri::Manager;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -12,6 +15,12 @@ fn greet(name: &str) -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
@@ -29,6 +38,7 @@ pub fn run() {
             history::history_status,
             history::history_initialize,
             history::history_checkpoint,
+            clipboard::read_native_clipboard,
             attachments::write_temp_attachment,
             attachments::save_attachment_to_path,
             attachment_watch::start_attachment_watch,

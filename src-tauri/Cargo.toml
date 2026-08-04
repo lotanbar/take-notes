@@ -21,9 +21,13 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 notify = "6"
 notify-debouncer-mini = "0.4"
 git2 = { version = "0.20", default-features = false }
 sha2 = "0.10"
+fs2 = "0.4"
+arboard = "3.6.1"
+png = "0.17"

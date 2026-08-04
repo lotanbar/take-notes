@@ -1,9 +1,10 @@
 use git2::{IndexAddOption, Repository, Signature, Time};
+use fs2::FileExt;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
@@ -12,6 +13,20 @@ const VAULT_FILE: &str = "vault.vlt";
 const RECOVERY_FILE: &str = "RECOVERY.md";
 
 static HISTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+// The Mutex serializes work inside one app process. The file lock covers a
+// second app instance (including a release build and `tauri dev`) using the
+// same vault at the same time.
+struct HistoryGuard {
+    _process_guard: MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl Drop for HistoryGuard {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +62,20 @@ fn app_history_dirs(app: &tauri::AppHandle, source_path: &str) -> Result<(PathBu
     let local = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let roaming = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok((history_dir(&local, source_path), history_dir(&roaming.join("secondary-history"), source_path)))
+}
+
+fn lock_history(app: &tauri::AppHandle, source_path: &str) -> Result<(PathBuf, PathBuf, HistoryGuard), String> {
+    let process_guard = HISTORY_LOCK.get_or_init(|| Mutex::new(())).lock()
+        .map_err(|_| "history lock poisoned".to_string())?;
+    let (primary, mirror) = app_history_dirs(app, source_path)?;
+    let parent = primary.parent().ok_or_else(|| "history has no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| format!("creating history lock directory failed: {e}"))?;
+    make_private(parent)?;
+    let lock_name = format!(".{}.lock", primary.file_name().unwrap_or_default().to_string_lossy());
+    let file = OpenOptions::new().create(true).read(true).write(true).open(parent.join(lock_name))
+        .map_err(|e| format!("opening history lock failed: {e}"))?;
+    file.lock_exclusive().map_err(|e| format!("locking recovery history failed: {e}"))?;
+    Ok((primary, mirror, HistoryGuard { _process_guard: process_guard, file }))
 }
 
 fn inspect(repo_path: &Path, source_path: &str) -> RepoCheck {
@@ -88,6 +117,34 @@ fn inspect_pair(primary: &Path, mirror: &Path, source_path: &str) -> HistoryStat
         return HistoryStatus { status: "corrupt".into(), repository_path: primary.to_string_lossy().into(), mirror_repository_path: mirror.to_string_lossy().into(), detail: Some("the two recovery histories are out of sync".into()) };
     }
     HistoryStatus { status: "ready".into(), repository_path: primary.to_string_lossy().into(), mirror_repository_path: mirror.to_string_lossy().into(), detail: None }
+}
+
+// A crash can occur after one repository advances HEAD but before the other
+// does. If one HEAD is a strict descendant of the other, there is no fork and
+// the ahead repository is an unambiguous source from which to rebuild the
+// lagging mirror. Unrelated/divergent histories are never auto-repaired.
+fn reconcile_pair(primary: &Path, mirror: &Path, source_path: &str) -> Result<HistoryStatus, String> {
+    let status = inspect_pair(primary, mirror, source_path);
+    if status.status != "corrupt" || status.detail.as_deref() != Some("the two recovery histories are out of sync") {
+        return Ok(status);
+    }
+    let primary_repo = Repository::open(primary).map_err(|e| e.to_string())?;
+    let mirror_repo = Repository::open(mirror).map_err(|e| e.to_string())?;
+    let primary_head = primary_repo.refname_to_id("HEAD").map_err(|e| e.to_string())?;
+    let mirror_head = mirror_repo.refname_to_id("HEAD").map_err(|e| e.to_string())?;
+
+    if primary_repo.graph_descendant_of(primary_head, mirror_head).unwrap_or(false) {
+        drop(primary_repo);
+        drop(mirror_repo);
+        seed_mirror(primary, mirror)?;
+    } else if mirror_repo.graph_descendant_of(mirror_head, primary_head).unwrap_or(false) {
+        drop(primary_repo);
+        drop(mirror_repo);
+        seed_mirror(mirror, primary)?;
+    } else {
+        return Ok(status);
+    }
+    Ok(inspect_pair(primary, mirror, source_path))
 }
 
 fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
@@ -185,8 +242,8 @@ fn make_private(_path: &Path) -> Result<(), String> { Ok(()) }
 #[tauri::command]
 pub async fn history_status(app: tauri::AppHandle, source_path: String) -> Result<HistoryStatus, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (primary, mirror) = app_history_dirs(&app, &source_path)?;
-        Ok(inspect_pair(&primary, &mirror, &source_path))
+        let (primary, mirror, _guard) = lock_history(&app, &source_path)?;
+        reconcile_pair(&primary, &mirror, &source_path)
     })
     .await
     .map_err(|e| format!("history worker failed: {e}"))?
@@ -200,11 +257,13 @@ pub async fn history_initialize(app: tauri::AppHandle, source_path: String, vaul
 }
 
 fn history_initialize_blocking(app: tauri::AppHandle, source_path: String, vault_path: String) -> Result<HistoryStatus, String> {
-    let _guard = HISTORY_LOCK.get_or_init(|| Mutex::new(())).lock().map_err(|_| "history lock poisoned".to_string())?;
-    let (primary, mirror) = app_history_dirs(&app, &source_path)?;
-    let existing = inspect_pair(&primary, &mirror, &source_path);
+    let (primary, mirror, _guard) = lock_history(&app, &source_path)?;
+    let existing = reconcile_pair(&primary, &mirror, &source_path)?;
     if existing.status == "ready" {
         return Ok(existing);
+    }
+    if inspect(&primary, &source_path).status == "ready" && inspect(&mirror, &source_path).status == "ready" {
+        return Err(existing.detail.unwrap_or_else(|| "recovery histories have diverged".into()));
     }
     if inspect(&primary, &source_path).status != "ready" {
         if inspect(&mirror, &source_path).status == "ready" {
@@ -237,9 +296,8 @@ pub async fn history_checkpoint(app: tauri::AppHandle, source_path: String, vaul
 }
 
 fn history_checkpoint_blocking(app: tauri::AppHandle, source_path: String, vault_path: String, reason: Option<String>) -> Result<bool, String> {
-    let _guard = HISTORY_LOCK.get_or_init(|| Mutex::new(())).lock().map_err(|_| "history lock poisoned".to_string())?;
-    let (primary_path, mirror_path) = app_history_dirs(&app, &source_path)?;
-    let status = inspect_pair(&primary_path, &mirror_path, &source_path);
+    let (primary_path, mirror_path, _guard) = lock_history(&app, &source_path)?;
+    let status = reconcile_pair(&primary_path, &mirror_path, &source_path)?;
     if status.status != "ready" { return Err(format!("history is {}: {}", status.status, status.detail.unwrap_or_default())); }
     let primary = Repository::open(&primary_path).map_err(|e| e.to_string())?;
     let mirror = Repository::open(&mirror_path).map_err(|e| e.to_string())?;
@@ -340,6 +398,63 @@ mod tests {
         assert_eq!(inspect_pair(&primary_path, &mirror_path, &source.to_string_lossy()).status, "ready");
         drop(primary);
         drop(mirror);
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn repairs_a_mirror_left_one_commit_behind() {
+        let parent = temp_dir("repair-behind");
+        fs::create_dir_all(&parent).unwrap();
+        let source = parent.join("source.vlt");
+        let primary_path = parent.join("primary");
+        let mirror_path = parent.join("mirror");
+        let primary = make_ready(&primary_path, &source, b"version one");
+        drop(primary);
+        seed_mirror(&primary_path, &mirror_path).unwrap();
+
+        fs::write(&source, b"version two").unwrap();
+        atomic_copy(&source, &primary_path.join(VAULT_FILE)).unwrap();
+        let primary = Repository::open(&primary_path).unwrap();
+        assert!(commit(&primary, "interrupted checkpoint", 1_700_000_100).unwrap());
+        drop(primary);
+
+        let broken = inspect_pair(&primary_path, &mirror_path, &source.to_string_lossy());
+        assert_eq!(broken.status, "corrupt");
+        let repaired = reconcile_pair(&primary_path, &mirror_path, &source.to_string_lossy()).unwrap();
+        assert_eq!(repaired.status, "ready");
+        assert_eq!(
+            Repository::open(&primary_path).unwrap().refname_to_id("HEAD").unwrap(),
+            Repository::open(&mirror_path).unwrap().refname_to_id("HEAD").unwrap(),
+        );
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn does_not_overwrite_truly_diverged_histories() {
+        let parent = temp_dir("keep-divergence");
+        fs::create_dir_all(&parent).unwrap();
+        let source = parent.join("source.vlt");
+        let primary_path = parent.join("primary");
+        let mirror_path = parent.join("mirror");
+        let primary = make_ready(&primary_path, &source, b"version one");
+        drop(primary);
+        seed_mirror(&primary_path, &mirror_path).unwrap();
+
+        fs::write(primary_path.join(VAULT_FILE), b"primary edit").unwrap();
+        fs::write(mirror_path.join(VAULT_FILE), b"mirror edit").unwrap();
+        let primary = Repository::open(&primary_path).unwrap();
+        let mirror = Repository::open(&mirror_path).unwrap();
+        assert!(commit(&primary, "primary", 1_700_000_100).unwrap());
+        assert!(commit(&mirror, "mirror", 1_700_000_100).unwrap());
+        let primary_head = primary.refname_to_id("HEAD").unwrap();
+        let mirror_head = mirror.refname_to_id("HEAD").unwrap();
+        drop(primary);
+        drop(mirror);
+
+        let status = reconcile_pair(&primary_path, &mirror_path, &source.to_string_lossy()).unwrap();
+        assert_eq!(status.status, "corrupt");
+        assert_eq!(Repository::open(&primary_path).unwrap().refname_to_id("HEAD").unwrap(), primary_head);
+        assert_eq!(Repository::open(&mirror_path).unwrap().refname_to_id("HEAD").unwrap(), mirror_head);
         fs::remove_dir_all(&parent).unwrap();
     }
 

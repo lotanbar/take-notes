@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import Fuse from "fuse.js";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import type { VaultFile, LegacyVaultFile, TreeNode, NodeType, BookmarkIndex, Attachment, NodeContent } from "../types/vault";
+import type { VaultFile, LegacyVaultFile, TreeNode, NodeType, BookmarkIndex, Attachment, InlineImage, NodeContent } from "../types/vault";
 import { deriveKey, encryptToB64, decryptFromB64, randomSaltB64, exportKeyB64, importKeyB64 } from "../crypto/crypto";
 import {
   insertNode,
@@ -898,6 +898,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
         bookmarks: parsed.bookmarks ?? [],
         links: parsed.links ?? [],
         attachments: (parsed.attachments ?? []) as Attachment[],
+        inlineImages: (parsed.inlineImages ?? []) as InlineImage[],
       };
     }
 
@@ -908,7 +909,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const legacyAttachments = (parsed?.type === "doc" ? [] : parsed?.attachments ?? []) as Attachment[];
     if (!legacyDoc) return null;
     const migrated = convertTiptapDocToPlainText(legacyDoc);
-    return { ...migrated, attachments: legacyAttachments };
+    return { ...migrated, attachments: legacyAttachments, inlineImages: [] };
   },
 
   saveNodeContentRaw: async (id, content) => {

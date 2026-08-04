@@ -4,6 +4,7 @@ import { acquireNoteModel, releaseNoteModel, flushSaveNow } from "../editor/note
 import { useVaultStore } from "../store/vaultStore";
 import { useZoomStore } from "../store/zoomStore";
 import { detectDirection } from "../lib/textDirection";
+import { clipboardImageFiles, mountInlineImageView, pasteInlineImages, pasteNativeClipboard } from "../editor/inlineImages";
 
 const BASE_FONT_SIZE = 12;
 const STICKINESS = monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges;
@@ -87,8 +88,43 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
     });
     editorRef.current = editor;
     registerIndentCarryingEnter(editor);
-    editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.LeftArrow, () => useVaultStore.getState().goBack());
-    editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.RightArrow, () => useVaultStore.getState().goForward());
+    const inlineImageView = mountInlineImageView(editor, noteState);
+    const editorDomNode = editor.getDomNode();
+    const handlePaste = (event: ClipboardEvent) => {
+      const files = clipboardImageFiles(event);
+      if (files.length === 0) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void pasteInlineImages(editor, noteState, files).catch((error) => {
+        useVaultStore.setState({ error: String(error) });
+      });
+    };
+    editorDomNode?.addEventListener("paste", handlePaste, true);
+    const handleNativePasteKey = (event: KeyboardEvent) => {
+      if (!("__TAURI_INTERNALS__" in window)) return;
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "v" || !noteState.loaded) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void pasteNativeClipboard(editor, noteState).catch((error) => {
+        useVaultStore.setState({ error: `Clipboard paste failed: ${String(error)}` });
+      });
+    };
+    editorDomNode?.addEventListener("keydown", handleNativePasteKey, true);
+    const editorId = editor.getId();
+    editor.addAction({
+      id: `vault-notes.back.${editorId}`,
+      label: "Go Back",
+      keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.LeftArrow],
+      keybindingContext: "editorTextFocus",
+      run: () => useVaultStore.getState().goBack(),
+    });
+    editor.addAction({
+      id: `vault-notes.forward.${editorId}`,
+      label: "Go Forward",
+      keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.RightArrow],
+      keybindingContext: "editorTextFocus",
+      run: () => useVaultStore.getState().goForward(),
+    });
     setEditorReady(true);
     refreshRtlLineDecorations(editor, noteState.model);
 
@@ -97,10 +133,22 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
       const model = editor.getModel();
       if (model) refreshRtlLineDecorations(editor, model);
     });
+    const pasteSub = editor.onDidPaste((event) => {
+      const files = clipboardImageFiles(event.clipboardEvent);
+      if (files.length > 0) {
+        void pasteInlineImages(editor, noteState, files).catch((error) => {
+          useVaultStore.setState({ error: String(error) });
+        });
+      }
+    });
 
     return () => {
       stopThemeWatch();
       contentSub.dispose();
+      pasteSub.dispose();
+      editorDomNode?.removeEventListener("paste", handlePaste, true);
+      editorDomNode?.removeEventListener("keydown", handleNativePasteKey, true);
+      inlineImageView.dispose();
       if (noteState.loaded) flushSaveNow(fileId);
       editor.dispose();
       releaseNoteModel(fileId);

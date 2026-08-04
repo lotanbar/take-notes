@@ -10,9 +10,11 @@ import {
   flushSaveNow,
   setBookmarkDecorations,
   setLinkDecorations,
+  setInlineImages,
   getDecorationRanges,
   type NoteModelState,
 } from "../editor/noteModel";
+import { clipboardImageFiles, mountInlineImageView, pasteInlineImages, pasteNativeClipboard } from "../editor/inlineImages";
 import { useVaultStore } from "../store/vaultStore";
 import { useZoomStore } from "../store/zoomStore";
 import { isLinkBroken } from "../lib/bookmarkOps";
@@ -238,13 +240,59 @@ export function Editor({ fileId, fileName }: EditorProps) {
     });
     editorRef.current = editor;
     registerIndentCarryingEnter(editor);
-    // Bound per Monaco instance rather than globally, so they only fire for
-    // whichever tab/pane currently has editor focus — Monaco's own keybinding
-    // service already scopes addCommand this way.
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB, () => handleBookmarkButtonClick());
-    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL, () => handleLinkButtonClick());
-    editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.LeftArrow, () => useVaultStore.getState().goBack());
-    editor.addCommand(monaco.KeyMod.Alt | monaco.KeyCode.RightArrow, () => useVaultStore.getState().goForward());
+    const inlineImageView = mountInlineImageView(editor, noteState);
+    const editorDomNode = editor.getDomNode();
+    const handlePaste = (event: ClipboardEvent) => {
+      const files = clipboardImageFiles(event);
+      if (files.length === 0) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void pasteInlineImages(editor, noteState, files).catch((error) => {
+        useVaultStore.setState({ error: String(error) });
+      });
+    };
+    editorDomNode?.addEventListener("paste", handlePaste, true);
+    const handleNativePasteKey = (event: KeyboardEvent) => {
+      if (!("__TAURI_INTERNALS__" in window)) return;
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "v" || !noteState.loaded) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void pasteNativeClipboard(editor, noteState).catch((error) => {
+        useVaultStore.setState({ error: `Clipboard paste failed: ${String(error)}` });
+      });
+    };
+    editorDomNode?.addEventListener("keydown", handleNativePasteKey, true);
+    // addAction scopes each keybinding to this editor id. addCommand uses
+    // Monaco's shared keybinding service and can invoke a different pane.
+    const editorId = editor.getId();
+    editor.addAction({
+      id: `vault-notes.bookmark.${editorId}`,
+      label: "Toggle Bookmark",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyB],
+      keybindingContext: "editorTextFocus",
+      run: () => handleBookmarkButtonClick(),
+    });
+    editor.addAction({
+      id: `vault-notes.link.${editorId}`,
+      label: "Toggle Link",
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL],
+      keybindingContext: "editorTextFocus",
+      run: () => handleLinkButtonClick(),
+    });
+    editor.addAction({
+      id: `vault-notes.back.${editorId}`,
+      label: "Go Back",
+      keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.LeftArrow],
+      keybindingContext: "editorTextFocus",
+      run: () => useVaultStore.getState().goBack(),
+    });
+    editor.addAction({
+      id: `vault-notes.forward.${editorId}`,
+      label: "Go Forward",
+      keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.RightArrow],
+      keybindingContext: "editorTextFocus",
+      run: () => useVaultStore.getState().goForward(),
+    });
     setEditorReady(true);
 
     const stopThemeWatch = watchThemeChanges((theme) => editor.updateOptions({ theme }));
@@ -264,6 +312,14 @@ export function Editor({ fileId, fileName }: EditorProps) {
         refreshToolbarState();
       }),
       editor.onDidChangeCursorSelection(() => refreshToolbarState()),
+      editor.onDidPaste((event) => {
+        const files = clipboardImageFiles(event.clipboardEvent);
+        if (files.length > 0) {
+          void pasteInlineImages(editor, noteState, files).catch((error) => {
+            useVaultStore.setState({ error: String(error) });
+          });
+        }
+      }),
       editor.onMouseDown((e: monaco.editor.IEditorMouseEvent) => {
         if (!(e.event.ctrlKey || e.event.metaKey)) return;
         if (!e.target.position) return;
@@ -296,21 +352,23 @@ export function Editor({ fileId, fileName }: EditorProps) {
           // which no longer apply, so treat the current buffer as a fresh,
           // mark-less note; attachments are unaffected by text edits, so keep those.
           const attachments = result?.attachments ?? [];
+          const inlineImages = result?.inlineImages ?? [];
           noteState.attachments = attachments;
           setAttachments(attachments);
+          setInlineImages(noteState, inlineImages);
           noteState.bookmarkMeta = [];
           setBookmarkDecorations(noteState, []);
           noteState.linkMeta = [];
           setLinkDecorations(noteState, []);
           noteState.prevBookmarkWidths = new Map();
-          noteState.latestContent = { text: model.getValue(), bookmarks: [], links: [], attachments };
+          noteState.latestContent = { text: model.getValue(), bookmarks: [], links: [], attachments, inlineImages };
           noteState.loaded = true;
           refreshRtlLineDecorations(editor, model);
           refreshToolbarState();
           return;
         }
 
-        const content = result ?? { text: "", bookmarks: [], links: [], attachments: [] };
+        const content = result ?? { text: "", bookmarks: [], links: [], attachments: [], inlineImages: [] };
         model.setValue(content.text);
 
         const index = useVaultStore.getState().vault?.index ?? {};
@@ -331,6 +389,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
 
         noteState.attachments = content.attachments;
         setAttachments(content.attachments);
+        setInlineImages(noteState, content.inlineImages);
         noteState.prevBookmarkWidths = new Map(content.bookmarks.map((b) => [b.bookmarkId, b.to - b.from]));
         noteState.latestContent = content;
         noteState.loaded = true;
@@ -374,6 +433,9 @@ export function Editor({ fileId, fileName }: EditorProps) {
       cancelled = true;
       mountedRef.current = false;
       unregisterAttachmentUpdateHandler(fileId);
+      editorDomNode?.removeEventListener("paste", handlePaste, true);
+      editorDomNode?.removeEventListener("keydown", handleNativePasteKey, true);
+      inlineImageView.dispose();
       stopThemeWatch();
       for (const d of disposables) d.dispose();
       if (rejectTimer.current) {

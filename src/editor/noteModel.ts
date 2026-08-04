@@ -13,7 +13,7 @@
 // as long as ANY view of the note is open.
 import { monaco } from "./monacoSetup";
 import { useVaultStore } from "../store/vaultStore";
-import type { Attachment, NodeContent } from "../types/vault";
+import type { Attachment, InlineImage, NodeContent } from "../types/vault";
 
 const SAVE_DEBOUNCE_MS = 500;
 const STICKINESS = monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges;
@@ -29,7 +29,7 @@ export interface LinkMeta {
   broken: boolean;
 }
 
-const EMPTY_CONTENT: NodeContent = { text: "", bookmarks: [], links: [], attachments: [] };
+const EMPTY_CONTENT: NodeContent = { text: "", bookmarks: [], links: [], attachments: [], inlineImages: [] };
 
 export interface NoteModelState {
   fileId: string;
@@ -44,6 +44,9 @@ export interface NoteModelState {
   linkDecoIds: string[];
 
   attachments: Attachment[];
+  inlineImages: InlineImage[];
+  inlineImageDecoIds: string[];
+  inlineImageListeners: Set<() => void>;
   latestContent: NodeContent;
 
   saveTimer: ReturnType<typeof setTimeout> | null;
@@ -94,6 +97,9 @@ export function acquireNoteModel(fileId: string): AcquireResult {
     linkMeta: [],
     linkDecoIds: [],
     attachments: [],
+    inlineImages: [],
+    inlineImageDecoIds: [],
+    inlineImageListeners: new Set(),
     latestContent: EMPTY_CONTENT,
     saveTimer: null,
     prevBookmarkWidths: new Map(),
@@ -141,6 +147,63 @@ export function setLinkDecorations(state: NoteModelState, ranges: monaco.Range[]
     },
   }));
   state.linkDecoIds = state.model.deltaDecorations(state.linkDecoIds, decos);
+}
+
+function notifyInlineImages(state: NoteModelState): void {
+  for (const listener of state.inlineImageListeners) listener();
+}
+
+export function subscribeInlineImages(state: NoteModelState, listener: () => void): () => void {
+  state.inlineImageListeners.add(listener);
+  return () => state.inlineImageListeners.delete(listener);
+}
+
+export function getInlineImages(state: NoteModelState): InlineImage[] {
+  return state.inlineImages.map((image, index) => {
+    const range = state.model.getDecorationRange(state.inlineImageDecoIds[index]);
+    return { ...image, at: range ? state.model.getOffsetAt(range.getStartPosition()) : image.at };
+  });
+}
+
+export function setInlineImages(state: NoteModelState, images: InlineImage[]): void {
+  state.inlineImages = images.map((image) => ({ ...image }));
+  state.inlineImageDecoIds = state.model.deltaDecorations(
+    state.inlineImageDecoIds,
+    images.map((image) => ({
+      range: monaco.Range.fromPositions(state.model.getPositionAt(image.at)),
+      options: { stickiness: STICKINESS },
+    })),
+  );
+  notifyInlineImages(state);
+}
+
+export function addInlineImage(state: NoteModelState, image: InlineImage): void {
+  setInlineImages(state, [...getInlineImages(state), image]);
+  state.latestContent = { ...state.latestContent, inlineImages: getInlineImages(state) };
+  scheduleFlush(state);
+}
+
+export function updateInlineImageSize(
+  state: NoteModelState,
+  id: string,
+  width: number,
+  height: number,
+  notify = false,
+): void {
+  const image = state.inlineImages.find((candidate) => candidate.id === id);
+  if (!image) return;
+  image.width = Math.max(80, Math.round(width));
+  image.height = Math.max(60, Math.round(height));
+  state.latestContent = { ...state.latestContent, inlineImages: getInlineImages(state) };
+  scheduleFlush(state);
+  if (notify) notifyInlineImages(state);
+}
+
+export function removeInlineImage(state: NoteModelState, id: string): void {
+  const images = getInlineImages(state).filter((image) => image.id !== id);
+  setInlineImages(state, images);
+  state.latestContent = { ...state.latestContent, inlineImages: images };
+  scheduleFlush(state);
 }
 
 function scheduleFlush(state: NoteModelState) {
@@ -239,6 +302,8 @@ function handleContentChange(state: NoteModelState) {
     bookmarks: nextBookmarks,
     links: nextLinks,
     attachments: state.attachments,
+    inlineImages: getInlineImages(state),
   };
+  notifyInlineImages(state);
   scheduleFlush(state);
 }

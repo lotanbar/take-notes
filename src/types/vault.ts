@@ -61,6 +61,16 @@ export interface Attachment {
   data: string; // base64, no "data:mime;base64," prefix
 }
 
+export interface InlineImage {
+  id: string;
+  mimeType: string;
+  size: number;
+  data: string; // base64, no data-URL prefix
+  at: number; // text offset whose line the image is displayed after
+  width: number;
+  height: number;
+}
+
 export interface BookmarkRange {
   bookmarkId: string;
   label: string;
@@ -80,4 +90,5 @@ export interface NodeContent {
   bookmarks: BookmarkRange[];
   links: LinkRange[];
   attachments: Attachment[];
+  inlineImages: InlineImage[];
 }
