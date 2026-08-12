@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -41,6 +42,7 @@ pub struct BlobLocation {
     #[serde(rename = "payloadOffset")]
     payload_offset: u64,
     length: u64,
+    checksum: String,
 }
 
 fn read_trailer(file: &mut File, file_len: u64) -> Option<(u64, u64)> {
@@ -104,6 +106,12 @@ fn append_record(file: &mut File, tag: u8, payload: &[u8]) -> Result<u64, String
     Ok(offset)
 }
 
+fn write_trailer(file: &mut File, header_offset: u64, version: u64) -> Result<(), String> {
+    file.write_all(&header_offset.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&version.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(TRAILER_MAGIC).map_err(|e| e.to_string())
+}
+
 /// Reads just the header (small: tree structure + metadata, no note bodies)
 /// if this is a v2 container, or the whole file if it's the old flat-JSON
 /// format (caller migrates in that case).
@@ -144,14 +152,23 @@ pub fn open_vault_file(path: String) -> Result<VaultOpenResult, String> {
 pub fn vault_append_blob(path: String, data_b64: String) -> Result<BlobLocation, String> {
     let mut file = open_rw(&path)?;
     ensure_magic(&mut file)?;
+    let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+    let prior_trailer = read_trailer(&mut file, file_len);
     let data = general_purpose::STANDARD
         .decode(data_b64.as_bytes())
         .map_err(|e| e.to_string())?;
     let offset = append_record(&mut file, b'B', &data)?;
+    // Keep the previous header generation readable until a new header is
+    // durably published. A crash between blob append and header write then
+    // leaves only an unreachable blob, never a vault with a missing trailer.
+    if let Some((header_offset, version)) = prior_trailer {
+        write_trailer(&mut file, header_offset, version)?;
+    }
     file.sync_all().map_err(|e| e.to_string())?;
     Ok(BlobLocation {
         payload_offset: offset + RECORD_PREFIX_LEN,
         length: data.len() as u64,
+        checksum: format!("{:x}", Sha256::digest(&data)),
     })
 }
 
@@ -164,21 +181,34 @@ pub fn vault_write_header(path: String, header_json: String) -> Result<(), Strin
     let payload = header_json.into_bytes();
     let header_offset = append_record(&mut file, b'H', &payload)?;
 
-    let mut trailer = Vec::with_capacity(TRAILER_LEN as usize);
-    trailer.extend_from_slice(&header_offset.to_le_bytes());
-    trailer.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    trailer.extend_from_slice(TRAILER_MAGIC);
-    file.write_all(&trailer).map_err(|e| e.to_string())?;
+    write_trailer(&mut file, header_offset, FORMAT_VERSION)?;
     file.sync_all().map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
-pub fn read_vault_blob(path: String, payload_offset: u64, length: u64) -> Result<String, String> {
+pub fn read_vault_blob(path: String, payload_offset: u64, length: u64, checksum: Option<String>) -> Result<String, String> {
     let mut file = File::open(&path).map_err(|e| e.to_string())?;
+    let file_len = file.metadata().map_err(|e| e.to_string())?.len();
+    if payload_offset < RECORD_PREFIX_LEN || length > file_len || payload_offset > file_len.saturating_sub(length) {
+        return Err("vault record is malformed (blob reference is out of bounds)".into());
+    }
+    file.seek(SeekFrom::Start(payload_offset - RECORD_PREFIX_LEN)).map_err(|e| e.to_string())?;
+    let mut prefix = [0u8; RECORD_PREFIX_LEN as usize];
+    file.read_exact(&mut prefix).map_err(|_| "vault record is malformed (missing blob prefix)".to_string())?;
+    let stored_length = u64::from_le_bytes(prefix[1..9].try_into().map_err(|_| "vault record is malformed (bad length)".to_string())?);
+    if prefix[0] != b'B' || stored_length != length {
+        return Err("vault record is malformed (blob tag or length mismatch)".into());
+    }
     file.seek(SeekFrom::Start(payload_offset)).map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; length as usize];
     file.read_exact(&mut buf).map_err(|e| e.to_string())?;
+    if let Some(expected) = checksum {
+        let actual = format!("{:x}", Sha256::digest(&buf));
+        if actual != expected.to_ascii_lowercase() {
+            return Err("vault record checksum mismatch".into());
+        }
+    }
     Ok(general_purpose::STANDARD.encode(&buf))
 }
 
@@ -307,7 +337,7 @@ mod tests {
             VaultOpenResult::Legacy { .. } => panic!("expected v2"),
         }
 
-        let blob_b64 = read_vault_blob(path.clone(), loc.payload_offset, loc.length).unwrap();
+        let blob_b64 = read_vault_blob(path.clone(), loc.payload_offset, loc.length, Some(loc.checksum)).unwrap();
         assert_eq!(unb64(&blob_b64), "hello note content");
 
         std::fs::remove_file(&path).ok();
@@ -338,18 +368,42 @@ mod tests {
         }
 
         assert_eq!(
-            unb64(&read_vault_blob(path.clone(), loc_a.payload_offset, loc_a.length).unwrap()),
+            unb64(&read_vault_blob(path.clone(), loc_a.payload_offset, loc_a.length, Some(loc_a.checksum)).unwrap()),
             "note A content"
         );
         assert_eq!(
-            unb64(&read_vault_blob(path.clone(), loc_b.payload_offset, loc_b.length).unwrap()),
+            unb64(&read_vault_blob(path.clone(), loc_b.payload_offset, loc_b.length, Some(loc_b.checksum)).unwrap()),
             "note B content"
         );
         assert_eq!(
-            unb64(&read_vault_blob(path.clone(), loc_a2.payload_offset, loc_a2.length).unwrap()),
+            unb64(&read_vault_blob(path.clone(), loc_a2.payload_offset, loc_a2.length, Some(loc_a2.checksum)).unwrap()),
             "note A edited content"
         );
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blob_append_keeps_previous_generation_openable() {
+        let path = temp_path("append-crash-window");
+        vault_create_fresh(path.clone()).unwrap();
+        vault_write_header(path.clone(), r#"{"generation":1}"#.to_string()).unwrap();
+        vault_append_blob(path.clone(), b64("not referenced yet")).unwrap();
+        match open_vault_file(path.clone()).unwrap() {
+            VaultOpenResult::V2 { header } => assert_eq!(header, r#"{"generation":1}"#),
+            VaultOpenResult::Legacy { .. } => panic!("expected v2"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn blob_reads_reject_header_and_out_of_bounds_references() {
+        let path = temp_path("blob-bounds");
+        vault_create_fresh(path.clone()).unwrap();
+        let loc = vault_append_blob(path.clone(), b64("valid")).unwrap();
+        vault_write_header(path.clone(), r#"{"tree":{}}"#.to_string()).unwrap();
+        assert!(read_vault_blob(path.clone(), loc.payload_offset, loc.length + 1, None).is_err());
+        assert!(read_vault_blob(path.clone(), 1, 5, None).is_err());
         std::fs::remove_file(&path).ok();
     }
 
@@ -398,7 +452,7 @@ mod tests {
             VaultOpenResult::Legacy { .. } => panic!("expected v2"),
         }
         assert_eq!(
-            unb64(&read_vault_blob(path.clone(), loc.payload_offset, loc.length).unwrap()),
+            unb64(&read_vault_blob(path.clone(), loc.payload_offset, loc.length, Some(loc.checksum)).unwrap()),
             "new vault's note"
         );
 

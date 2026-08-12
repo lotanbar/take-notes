@@ -199,6 +199,7 @@ export function replaceInlineImage(
   image.mimeType = replacement.mimeType;
   image.size = replacement.size;
   image.data = replacement.data;
+  delete image.blobRef;
   delete image.pendingOptimization;
   state.latestContent = { ...state.latestContent, inlineImages: persistentInlineImages(state) };
   notifyInlineImages(state);
@@ -254,14 +255,42 @@ function scheduleFlush(state: NoteModelState) {
   state.saveTimer = setTimeout(() => flushSave(state), SAVE_DEBOUNCE_MS);
 }
 
+function contentForSave(state: NoteModelState): NodeContent {
+  const model = state.model;
+  const bookmarks = state.bookmarkMeta.map((meta, i) => {
+    const range = model.getDecorationRange(state.bookmarkDecoIds[i]);
+    return {
+      ...meta,
+      from: range ? model.getOffsetAt(range.getStartPosition()) : 0,
+      to: range ? model.getOffsetAt(range.getEndPosition()) : 0,
+    };
+  });
+  const links = state.linkMeta.map((meta, i) => {
+    const range = model.getDecorationRange(state.linkDecoIds[i]);
+    return {
+      linkId: meta.linkId,
+      targetBookmarkId: meta.targetBookmarkId,
+      from: range ? model.getOffsetAt(range.getStartPosition()) : 0,
+      to: range ? model.getOffsetAt(range.getEndPosition()) : 0,
+    };
+  });
+  const content = {
+    text: model.getValue(),
+    bookmarks,
+    links,
+    attachments: state.attachments,
+    inlineImages: persistentInlineImages(state),
+  };
+  state.latestContent = content;
+  return content;
+}
+
 function flushSave(state: NoteModelState): Promise<void> {
   if (state.saveTimer) clearTimeout(state.saveTimer);
   state.saveTimer = null;
   if (!state.loaded) return Promise.resolve();
   const { runExclusive, saveNodeContentRaw } = useVaultStore.getState();
-  return runExclusive(state.fileId, () =>
-    saveNodeContentRaw(state.fileId, { ...state.latestContent, attachments: state.attachments }),
-  );
+  return runExclusive(state.fileId, () => saveNodeContentRaw(state.fileId, contentForSave(state)));
 }
 
 // Exposed for callers that need an immediate (non-debounced) save, e.g. on
@@ -300,16 +329,6 @@ function handleContentChange(state: NoteModelState) {
     };
   });
 
-  const nextLinks = state.linkMeta.map((meta, i) => {
-    const range = model.getDecorationRange(state.linkDecoIds[i]);
-    return {
-      linkId: meta.linkId,
-      targetBookmarkId: meta.targetBookmarkId,
-      from: range ? model.getOffsetAt(range.getStartPosition()) : 0,
-      to: range ? model.getOffsetAt(range.getEndPosition()) : 0,
-    };
-  });
-
   if (!state.skipShrinkCheckOnce) {
     const shrunkIds: string[] = [];
     for (const b of nextBookmarks) {
@@ -343,10 +362,11 @@ function handleContentChange(state: NoteModelState) {
   state.latestContent = {
     text: model.getValue(),
     bookmarks: nextBookmarks,
-    links: nextLinks,
+    // Link offsets and image positions are derived from Monaco decorations
+    // only at save time; ordinary typing must not rescan or rebuild them.
+    links: state.latestContent.links,
     attachments: state.attachments,
-    inlineImages: persistentInlineImages(state),
+    inlineImages: state.latestContent.inlineImages,
   };
-  notifyInlineImages(state);
   scheduleFlush(state);
 }

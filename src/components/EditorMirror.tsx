@@ -29,9 +29,24 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
   const [editorReady, setEditorReady] = useState(false);
 
 
-  function refreshRtlLineDecorations(editor: monaco.editor.IStandaloneCodeEditor, model: monaco.editor.ITextModel) {
-    const decos: { range: monaco.Range; options: monaco.editor.IModelDecorationOptions }[] = [];
-    for (let line = 1; line <= model.getLineCount(); line++) {
+  function refreshRtlLineDecorations(
+    editor: monaco.editor.IStandaloneCodeEditor,
+    model: monaco.editor.ITextModel,
+    changes?: readonly monaco.editor.IModelContentChange[],
+  ) {
+    const lineCount = model.getLineCount();
+    const first = changes ? Math.max(1, Math.min(...changes.map((c) => c.range.startLineNumber)) - 1) : 1;
+    const last = changes
+      ? Math.min(lineCount, Math.max(...changes.map((c) => c.range.startLineNumber + c.text.split("\n").length)) + 1)
+      : lineCount;
+    const kept = changes
+      ? (rtlLineDecosRef.current?.getRanges() ?? []).filter((range) => range.endLineNumber < first || range.startLineNumber > last)
+      : [];
+    const decos: { range: monaco.Range; options: monaco.editor.IModelDecorationOptions }[] = kept.map((range) => ({
+      range,
+      options: { inlineClassName: "rtl-line", stickiness: STICKINESS },
+    }));
+    for (let line = first; line <= last; line++) {
       const content = model.getLineContent(line);
       if (content.trim() && detectDirection(content) === "rtl") {
         decos.push({
@@ -129,9 +144,9 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
     refreshRtlLineDecorations(editor, noteState.model);
 
     const stopThemeWatch = watchThemeChanges((theme) => editor.updateOptions({ theme }));
-    const contentSub = editor.onDidChangeModelContent(() => {
+    const contentSub = editor.onDidChangeModelContent((event) => {
       const model = editor.getModel();
-      if (model) refreshRtlLineDecorations(editor, model);
+      if (model) refreshRtlLineDecorations(editor, model, event.changes);
     });
     const pasteSub = editor.onDidPaste((event) => {
       const files = clipboardImageFiles(event.clipboardEvent);

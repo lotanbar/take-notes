@@ -5,6 +5,7 @@ export type NodeType = "file" | "folder";
 export interface ContentRef {
   payloadOffset: number;
   length: number;
+  checksum?: string;
 }
 
 export interface TreeNode {
@@ -18,6 +19,9 @@ export interface TreeNode {
   lockSalt?: string;
   lockCheck?: string;
   contentRef?: ContentRef;
+  // v3 immutable attachment/image records. Kept in the unencrypted header so
+  // compaction can preserve locked notes without requiring their passwords.
+  blobRefs?: ContentRef[];
 }
 
 export interface BookmarkIndexEntry {
@@ -58,14 +62,16 @@ export interface Attachment {
   name: string;
   mimeType: string;
   size: number;
-  data: string; // base64, no "data:mime;base64," prefix
+  data: string; // populated at runtime; empty when persisted via blobRef
+  blobRef?: ContentRef;
 }
 
 export interface InlineImage {
   id: string;
   mimeType: string;
   size: number;
-  data: string; // base64, no data-URL prefix
+  data: string; // populated at runtime; empty when persisted via blobRef
+  blobRef?: ContentRef;
   at: number; // text offset whose line the image is displayed after
   width: number;
   height: number;

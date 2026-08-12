@@ -10,7 +10,14 @@ import { PasswordPrompt } from "./components/PasswordPrompt";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { EditorPanel, type NotePanelParams } from "./components/EditorPanel";
 import { findNode, flattenTree } from "./lib/treeOps";
-import { loadLayout, saveLayout } from "./lib/sessionStore";
+import {
+  clearNodeSessions,
+  clearUnfinishedShutdown,
+  loadLayout,
+  recordUnfinishedShutdown,
+  saveLayout,
+  type ClosePhase,
+} from "./lib/sessionStore";
 import {
   getInlineImageOptimizationSnapshot,
   initializeInlineImageOptimizations,
@@ -23,6 +30,18 @@ import "./App.css";
 const DOCKVIEW_COMPONENTS = { note: EditorPanel };
 
 const LAYOUT_SAVE_DEBOUNCE_MS = 500;
+const CLOSE_LABELS: Record<ClosePhase, string> = {
+  "saving-notes": "Saving notes…",
+  "syncing-vault": "Syncing vault…",
+  "updating-history": "Updating recovery history…",
+  "relocking-notes": "Relocking notes…",
+  closing: "Closing…",
+};
+
+interface CloseStatus {
+  phase: ClosePhase;
+  error?: string;
+}
 
 function EmptyWatermark() {
   return (
@@ -64,6 +83,7 @@ function App() {
   const restoredForPathRef = useRef<string | null>(null);
   const layoutSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closeProceedingRef = useRef(false);
+  const [closeStatus, setCloseStatus] = useState<CloseStatus | null>(null);
   const [showOptimizationCloseWarning, setShowOptimizationCloseWarning] = useState(false);
   const [waitingForOptimizations, setWaitingForOptimizations] = useState(false);
   const optimizationSnapshot = useSyncExternalStore(
@@ -76,12 +96,34 @@ function App() {
     if (closeProceedingRef.current) return;
     closeProceedingRef.current = true;
     setShowOptimizationCloseWarning(false);
+    const closingPath = useVaultStore.getState().syncPath;
+    let currentPhase: ClosePhase = "saving-notes";
+    const updatePhase = (phase: ClosePhase) => {
+      currentPhase = phase;
+      setCloseStatus({ phase });
+      if (closingPath) recordUnfinishedShutdown(closingPath, phase);
+    };
+    updatePhase("saving-notes");
     try {
-      await useVaultStore.getState().flushForExit();
+      await useVaultStore.getState().flushForExit(updatePhase);
+      updatePhase("relocking-notes");
+      if (closingPath) clearNodeSessions(closingPath);
+      const api = dockviewApiRef.current;
+      if (api) {
+        const currentVault = useVaultStore.getState().vault;
+        for (const panel of [...api.panels]) {
+          const params = panel.params as NotePanelParams;
+          const node = currentVault ? findNode(currentVault.tree, params.fileId) : undefined;
+          if (params.mirror || node?.locked) panel.api.close();
+        }
+        if (closingPath) saveLayout(closingPath, api.toJSON());
+      }
+      updatePhase("closing");
+      clearUnfinishedShutdown();
       await getCurrentWindow().destroy();
     } catch (closeError) {
       closeProceedingRef.current = false;
-      useVaultStore.setState({ error: `The app could not finish saving before close: ${String(closeError)}` });
+      setCloseStatus({ phase: currentPhase, error: String(closeError) });
     }
   }
 
@@ -169,6 +211,19 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [vault?.tree]);
 
+  // Relocking a note is transactional in the store. Once its key is gone,
+  // remove every primary/duplicate view so no stale editor remains visible.
+  useEffect(() => {
+    const api = dockviewApiRef.current;
+    const currentVault = useVaultStore.getState().vault;
+    if (!api || !currentVault) return;
+    for (const panel of [...api.panels]) {
+      const params = panel.params as NotePanelParams;
+      const node = findNode(currentVault.tree, params.fileId);
+      if (node?.locked && !sessionUnlockedIds.has(node.id)) panel.api.close();
+    }
+  }, [sessionUnlockedIds]);
+
   // Opens (or focuses, if already open) a tab whenever the "requested active
   // file" signal changes — driven by Sidebar clicks, search selection,
   // referrer navigation, ctrl+click bookmark links, and back/forward, all of
@@ -224,8 +279,8 @@ function App() {
     if (!("__TAURI_INTERNALS__" in window)) return;
     let unlisten: (() => void) | undefined;
     void getCurrentWindow().onCloseRequested((event) => {
-      if (closeProceedingRef.current) return;
       event.preventDefault();
+      if (closeProceedingRef.current) return;
       if (getInlineImageOptimizationSnapshot().pendingCount > 0) {
         setShowOptimizationCloseWarning(true);
         return;
@@ -392,6 +447,24 @@ function App() {
               if (!waitingForOptimizations) setShowOptimizationCloseWarning(false);
             }}
           />
+        )}
+        {closeStatus && (
+          <div className="modal-overlay close-overlay" role="alertdialog" aria-modal="true" aria-label="Saving and closing">
+            <div className="modal">
+              <h2>Saving and closing…</h2>
+              <p>{closeStatus.error ? `Close failed: ${closeStatus.error}` : CLOSE_LABELS[closeStatus.phase]}</p>
+              {closeStatus.error && (
+                <div className="modal-actions">
+                  <button type="button" onClick={() => { clearUnfinishedShutdown(); setCloseStatus(null); }}>
+                    Cancel Close
+                  </button>
+                  <button type="button" className="primary" onClick={() => void finishClose()}>
+                    Retry
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
         )}
       </div>
     </div>

@@ -46,7 +46,10 @@ import {
   loadNodeSessions,
   saveNodeSession,
   clearNodeSession,
+  clearUnfinishedShutdown,
+  readUnfinishedShutdown,
 } from "../lib/sessionStore";
+import type { ClosePhase } from "../lib/sessionStore";
 
 const MASTER_CHECK_SENTINEL = "vault-notes-master-check-v1";
 const LOCK_CHECK_SENTINEL = "vault-notes-lock-check-v1";
@@ -62,6 +65,13 @@ const BACKUP_SUFFIX = ".backup";
 const pendingContentSaves = new Map<string, Promise<void>>();
 let historyNeedsCheckpoint = false;
 let exitFlushInFlight: Promise<void> | null = null;
+let persistenceTail: Promise<unknown> = Promise.resolve();
+
+function coordinatePersistence<T>(work: () => Promise<T>): Promise<T> {
+  const run = persistenceTail.then(work, work);
+  persistenceTail = run.then(() => undefined, () => undefined);
+  return run;
+}
 
 type PendingAction =
   | { kind: "vault-create"; path: string }
@@ -77,7 +87,7 @@ type PendingAction =
       history: HistoryStatus;
     }
   | { kind: "node-lock"; id: string }
-  | { kind: "node-unlock"; id: string };
+  | { kind: "node-unlock"; id: string; destination?: NavPosition };
 
 function parseOpenResult(result: VaultOpenResult): { raw: VaultFile | LegacyVaultFile; legacy: boolean } {
   if (result.format === "v2") {
@@ -235,7 +245,7 @@ interface VaultState {
   saveVault: () => Promise<void>;
   saveVaultAs: () => Promise<void>;
   lockVault: () => Promise<void>;
-  flushForExit: () => Promise<void>;
+  flushForExit: (onPhase?: (phase: ClosePhase) => void) => Promise<void>;
 
   setSelection: (ids: string[]) => void;
   createNode: (type: NodeType, parentId: string | null, index: number) => TreeNode | null;
@@ -244,7 +254,7 @@ interface VaultState {
   deleteNodesAction: (ids: string[]) => void;
 
   addNodeLock: (id: string) => void;
-  toggleNodeLock: (id: string) => void;
+  toggleNodeLock: (id: string, destination?: NavPosition) => Promise<void>;
   removeNodeLock: (id: string) => Promise<void>;
 
   loadNodeContent: (id: string) => Promise<NodeContent | null>;
@@ -323,6 +333,18 @@ async function finalizeVaultOpen(
     navBack: [],
     navForward: [],
   });
+  const interrupted = readUnfinishedShutdown();
+  if (interrupted?.vaultPath === syncPath) {
+    try {
+      await openVaultFile(livePath);
+      await copyFileAtomic(livePath, syncPath);
+      await historyCheckpoint(syncPath, livePath, "Resumed interrupted shutdown");
+      clearUnfinishedShutdown();
+      set({ error: `The previous close was interrupted during ${interrupted.phase.replace(/-/g, " ")}; durable sync and recovery history were resumed successfully.` });
+    } catch (e) {
+      set({ error: `The previous close was interrupted during ${interrupted.phase.replace(/-/g, " ")}, and resuming it failed: ${String(e)}` });
+    }
+  }
 }
 
 async function openAfterHistoryCheck(
@@ -359,30 +381,45 @@ async function checkpointOpenVault(
   reason: string,
   compactAndPublish: boolean,
   publishWithoutCompaction = false,
+  onPhase?: (phase: ClosePhase) => void,
 ): Promise<void> {
+  cancelScheduledAutosave();
   const { flushAllDirtyNotes } = await import("../editor/noteModel");
   await flushAllDirtyNotes();
   await Promise.all([...pendingContentSaves.values()]);
 
-  let { filePath, syncPath, vault, dirty } = get();
-  if (!filePath || !syncPath || !vault) return;
-  if (dirty) {
-    vault = { ...vault, generation: (vault.generation ?? 0) + 1, deviceId: getDeviceId() };
-    await writeVaultHeader(filePath, await serializeVault(vault));
-    set({ vault, dirty: false });
-  }
-  const shouldCheckpoint = historyNeedsCheckpoint || compactAndPublish;
-  if (compactAndPublish) {
-    vault = await compactVaultInPlace(vault, filePath);
-    set({ vault, dirty: false });
-    await copyFileAtomic(filePath, syncPath);
-  } else if (publishWithoutCompaction && historyNeedsCheckpoint) {
-    await copyFileAtomic(filePath, syncPath);
-  }
-  if (shouldCheckpoint) {
-    await historyCheckpoint(syncPath, filePath, reason);
-    historyNeedsCheckpoint = false;
-  }
+  await coordinatePersistence(async () => {
+    let { filePath, syncPath, vault, dirty } = get();
+    if (!filePath || !syncPath || !vault) return;
+    if (dirty) {
+      const snapshot = vault;
+      vault = { ...snapshot, generation: (snapshot.generation ?? 0) + 1, deviceId: getDeviceId() };
+      await writeVaultHeader(filePath, await serializeVault(vault));
+      if (get().vault === snapshot) set({ vault, dirty: false });
+      else {
+        const latest = get().vault;
+        if (!latest) return;
+        vault = { ...latest, generation: vault.generation + 1, deviceId: getDeviceId() };
+        await writeVaultHeader(filePath, await serializeVault(vault));
+        if (get().vault === latest) set({ vault, dirty: false });
+      }
+    }
+    const shouldCheckpoint = historyNeedsCheckpoint || compactAndPublish;
+    if (compactAndPublish) {
+      vault = await compactVaultInPlace(vault, filePath);
+      if (!get().dirty) set({ vault });
+      onPhase?.("syncing-vault");
+      await copyFileAtomic(filePath, syncPath);
+    } else if (publishWithoutCompaction && historyNeedsCheckpoint) {
+      onPhase?.("syncing-vault");
+      await copyFileAtomic(filePath, syncPath);
+    }
+    if (shouldCheckpoint) {
+      onPhase?.("updating-history");
+      await historyCheckpoint(syncPath, filePath, reason);
+      historyNeedsCheckpoint = false;
+    }
+  });
 }
 
 function clearOpenVault(set: (partial: Partial<VaultState>) => void, error: string | null = null) {
@@ -455,12 +492,14 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   },
 
   openVault: async () => {
-    const { filePath: currentLivePath, syncPath: currentSyncPath, vault: currentVault, dirty } = get();
-    if (currentLivePath && currentVault && dirty) {
-      serializeVault(currentVault)
-        .then((headerJson) => writeVaultHeader(currentLivePath, headerJson))
-        .then(() => (currentSyncPath ? copyFileAtomic(currentLivePath, currentSyncPath) : undefined))
-        .catch(() => {});
+    if (get().vault) {
+      try {
+        cancelScheduledPublish();
+        await checkpointOpenVault(get, set, "Before opening another vault", false, true);
+      } catch (e) {
+        set({ error: `The current vault could not be saved before opening another one: ${String(e)}` });
+        return;
+      }
     }
     const path = await open({
       multiple: false,
@@ -522,7 +561,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
         const key = await deriveKey(password, salt);
         const masterCheck = await encryptToB64(key, MASTER_CHECK_SENTINEL);
         const newVaultFile: VaultFile = {
-          version: 2,
+          version: 3,
           salt,
           masterCheck,
           tree: newRootNode(),
@@ -564,8 +603,13 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     }
 
     if (pending.kind === "node-lock") {
+      const { flushSaveNow } = await import("../editor/noteModel");
+      await flushSaveNow(pending.id);
+      await (pendingContentSaves.get(pending.id) ?? Promise.resolve());
       if (!vault) return;
-      const node = findNode(vault.tree, pending.id);
+      const currentVault = get().vault;
+      if (!currentVault) return;
+      const node = findNode(currentVault.tree, pending.id);
       if (!node) return;
       const lockSalt = randomSaltB64();
       const key = await deriveKey(password, lockSalt);
@@ -622,7 +666,14 @@ export const useVaultStore = create<VaultState>((set, get) => ({
         sessionUnlockedIds.add(pending.id);
         const { syncPath } = get();
         if (syncPath) saveNodeSession(syncPath, pending.id, await exportKeyB64(key));
-        set({ nodeKeys, sessionUnlockedIds, pending: null, passwordError: null });
+        set({
+          nodeKeys,
+          sessionUnlockedIds,
+          pending: null,
+          passwordError: null,
+          activeFileId: pending.destination?.fileId ?? get().activeFileId,
+          activeBookmarkId: pending.destination?.bookmarkId ?? get().activeBookmarkId,
+        });
       } catch {
         set({ passwordError: "Incorrect password." });
       }
@@ -656,17 +707,16 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   clearError: () => set({ error: null }),
 
   saveVault: async () => {
-    const { filePath, syncPath, vault } = get();
-    if (!filePath || !vault) return;
     try {
-      // Bump the generation counter on every local header write — this is
-      // what lets a later open (on this device or another) tell whether the
-      // local live copy or the cloud copy actually has the newer edits.
-      const nextVault: VaultFile = { ...vault, generation: (vault.generation ?? 0) + 1, deviceId: getDeviceId() };
-      const headerJson = await serializeVault(nextVault);
-      await writeVaultHeader(filePath, headerJson);
-      set({ vault: nextVault, dirty: false, error: null });
-      if (syncPath) schedulePublish(filePath, syncPath);
+      await coordinatePersistence(async () => {
+        const { filePath, syncPath, vault } = get();
+        if (!filePath || !vault) return;
+        const nextVault: VaultFile = { ...vault, generation: (vault.generation ?? 0) + 1, deviceId: getDeviceId() };
+        await writeVaultHeader(filePath, await serializeVault(nextVault));
+        if (get().vault === vault) set({ vault: nextVault, dirty: false, error: null });
+        else set({ error: null });
+        if (syncPath) schedulePublish(filePath, syncPath);
+      });
     } catch (e) {
       set({ error: String(e) });
     }
@@ -717,15 +767,19 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   // compacts and publishes just like locking does -- covers the "just close
   // the window" half of never touching Save As. Awaited by the caller, so the
   // cloud copy is guaranteed up to date before the window actually closes.
-  flushForExit: async () => {
+  flushForExit: async (onPhase) => {
     if (!get().vault) return;
+    cancelScheduledAutosave();
     cancelScheduledPublish();
     if (!exitFlushInFlight) {
       // Closing is not a maintenance operation. Compaction rewrites every
       // live blob and can take a long time; Save As and explicit vault lock
       // still compact, while ordinary close only flushes changed bytes,
       // publishes them, and checkpoints history.
-      exitFlushInFlight = checkpointOpenVault(get, set, "Application closed", false, true).finally(() => {
+      exitFlushInFlight = (async () => {
+        onPhase?.("saving-notes");
+        await checkpointOpenVault(get, set, "Application closed", false, true, onPhase);
+      })().finally(() => {
         exitFlushInFlight = null;
       });
     }
@@ -810,27 +864,38 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     set({ pending: { kind: "node-lock", id }, passwordError: null });
   },
 
-  toggleNodeLock: (id) => {
+  toggleNodeLock: async (id, destination) => {
     const { vault, sessionUnlockedIds } = get();
     if (!vault) return;
     const node = findNode(vault.tree, id);
     if (!node || !node.locked) return;
 
     if (sessionUnlockedIds.has(id)) {
+      const { flushSaveNow } = await import("../editor/noteModel");
+      await flushSaveNow(id);
+      await (pendingContentSaves.get(id) ?? Promise.resolve());
       const nextSessionUnlocked = new Set(sessionUnlockedIds);
       nextSessionUnlocked.delete(id);
       const nextNodeKeys = new Map(get().nodeKeys);
       nextNodeKeys.delete(id);
       const { syncPath } = get();
       if (syncPath) clearNodeSession(syncPath, id);
-      set({ sessionUnlockedIds: nextSessionUnlocked, nodeKeys: nextNodeKeys });
+      set({
+        sessionUnlockedIds: nextSessionUnlocked,
+        nodeKeys: nextNodeKeys,
+        activeFileId: get().activeFileId === id ? null : get().activeFileId,
+        activeBookmarkId: get().activeFileId === id ? null : get().activeBookmarkId,
+      });
       return;
     }
 
-    set({ pending: { kind: "node-unlock", id }, passwordError: null });
+    set({ pending: { kind: "node-unlock", id, destination }, passwordError: null });
   },
 
   removeNodeLock: async (id) => {
+    const { flushSaveNow } = await import("../editor/noteModel");
+    await flushSaveNow(id);
+    await (pendingContentSaves.get(id) ?? Promise.resolve());
     const { vault, sessionUnlockedIds, nodeKeys, filePath, syncPath } = get();
     if (!vault || !filePath) return;
     const node = findNode(vault.tree, id);
@@ -895,12 +960,20 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
     // Current format: flat plain-text envelope.
     if (parsed && typeof parsed.text === "string") {
+      const loadAsset = async <T extends Attachment | InlineImage>(asset: T): Promise<T> => {
+        if (!asset.blobRef || asset.data) return asset;
+        const resolvedRef = asset.blobRef.checksum
+          ? node.blobRefs?.find((candidate) => candidate.checksum === asset.blobRef?.checksum) ?? asset.blobRef
+          : asset.blobRef;
+        const stored = await readVaultBlob(filePath, resolvedRef);
+        return { ...asset, data: await decryptFromB64(masterKey, stored) };
+      };
       return {
         text: parsed.text,
         bookmarks: parsed.bookmarks ?? [],
         links: parsed.links ?? [],
-        attachments: (parsed.attachments ?? []) as Attachment[],
-        inlineImages: (parsed.inlineImages ?? []) as InlineImage[],
+        attachments: await Promise.all(((parsed.attachments ?? []) as Attachment[]).map(loadAsset)),
+        inlineImages: await Promise.all(((parsed.inlineImages ?? []) as InlineImage[]).map(loadAsset)),
       };
     }
 
@@ -915,15 +988,35 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   },
 
   saveNodeContentRaw: async (id, content) => {
+    return coordinatePersistence(async () => {
     const { vault, masterKey, nodeKeys, filePath } = get();
     if (!vault || !masterKey || !filePath) return;
     const node = findNode(vault.tree, id);
     if (!node) return;
-    let payload = await encryptToB64(masterKey, JSON.stringify(content));
+    const nodeKey = node.locked ? nodeKeys.get(id) : undefined;
+    if (node.locked && !nodeKey) return;
+    const persistAsset = async <T extends Attachment | InlineImage>(asset: T): Promise<T> => {
+      if (asset.blobRef) return { ...asset, data: "" };
+      if (!asset.data) return asset;
+      // The note-level envelope (and therefore these opaque references) is
+      // additionally protected by the note password when locked. Keeping
+      // immutable assets master-encrypted avoids rewriting every large asset
+      // merely because a note lock is added or removed.
+      const stored = await encryptToB64(masterKey, asset.data);
+      const blobRef = await appendVaultBlob(filePath, stored);
+      if (await readVaultBlob(filePath, blobRef) !== stored) throw new Error(`verification failed for ${asset.id}`);
+      return { ...asset, data: "", blobRef };
+    };
+    const storedContent: NodeContent = {
+      ...content,
+      attachments: [],
+      inlineImages: [],
+    };
+    for (const attachment of content.attachments) storedContent.attachments.push(await persistAsset(attachment));
+    for (const image of content.inlineImages) storedContent.inlineImages.push(await persistAsset(image));
+    let payload = await encryptToB64(masterKey, JSON.stringify(storedContent));
     if (node.locked) {
-      const nodeKey = nodeKeys.get(id);
-      if (!nodeKey) return;
-      payload = await encryptToB64(nodeKey, payload);
+      payload = await encryptToB64(nodeKey!, payload);
     }
     // The vault file lives under external sync tools (e.g. Google Drive) that
     // can touch/re-upload it mid-write. Read back what actually landed on disk
@@ -954,8 +1047,12 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     // revert them.
     const latestVault = get().vault;
     if (!latestVault) return;
-    const nextTree = applyToNode(latestVault.tree, id, (n) => ({ ...n, contentRef, modifiedAt: Date.now() }));
-    set({ vault: { ...latestVault, tree: nextTree }, dirty: true });
+    const blobRefs = [...storedContent.attachments, ...storedContent.inlineImages]
+      .map((asset) => asset.blobRef)
+      .filter((ref): ref is NonNullable<typeof ref> => !!ref);
+    const nextTree = applyToNode(latestVault.tree, id, (n) => ({ ...n, contentRef, blobRefs, modifiedAt: Date.now() }));
+    set({ vault: { ...latestVault, version: 3, tree: nextTree }, dirty: true });
+    });
   },
 
   // Chains `work` onto any operation already in flight for this id, so two
@@ -1010,7 +1107,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   openFile: async (node) => {
     const { sessionUnlockedIds } = get();
     if (node.locked && !sessionUnlockedIds.has(node.id)) {
-      get().toggleNodeLock(node.id);
+      await get().toggleNodeLock(node.id, { fileId: node.id, bookmarkId: null });
       return;
     }
     const previous = get().activeFileId;
@@ -1026,7 +1123,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const hostNode = findNode(vault.tree, entry.hostFileId);
     if (!hostNode) return;
     if (hostNode.locked && !sessionUnlockedIds.has(hostNode.id)) {
-      get().toggleNodeLock(hostNode.id);
+      await get().toggleNodeLock(hostNode.id, { fileId: hostNode.id, bookmarkId: targetBookmarkId });
       return;
     }
     const nextBack = activeFileId ? [...navBack, { fileId: activeFileId, bookmarkId: activeBookmarkId }] : navBack;
@@ -1191,9 +1288,17 @@ useVaultStore.subscribe((state) => {
   historyNeedsCheckpoint = true;
   if (autosaveTimer) clearTimeout(autosaveTimer);
   autosaveTimer = setTimeout(() => {
+    autosaveTimer = null;
     useVaultStore.getState().saveVault();
   }, AUTOSAVE_DEBOUNCE_MS);
 });
+
+function cancelScheduledAutosave() {
+  if (autosaveTimer) {
+    clearTimeout(autosaveTimer);
+    autosaveTimer = null;
+  }
+}
 
 // Publishing copies the whole live file out to the cloud-facing path, unlike
 // the local autosave above (which only rewrites the small header record) —

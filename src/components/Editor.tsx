@@ -137,9 +137,24 @@ export function Editor({ fileId, fileName }: EditorProps) {
 
   // Judges direction per line (not per note) so a fully-English line inside
   // an otherwise-Hebrew note stays LTR, and vice versa.
-  function refreshRtlLineDecorations(editor: monaco.editor.IStandaloneCodeEditor, model: monaco.editor.ITextModel) {
-    const decos: { range: monaco.Range; options: monaco.editor.IModelDecorationOptions }[] = [];
-    for (let line = 1; line <= model.getLineCount(); line++) {
+  function refreshRtlLineDecorations(
+    editor: monaco.editor.IStandaloneCodeEditor,
+    model: monaco.editor.ITextModel,
+    changes?: readonly monaco.editor.IModelContentChange[],
+  ) {
+    const lineCount = model.getLineCount();
+    const first = changes ? Math.max(1, Math.min(...changes.map((c) => c.range.startLineNumber)) - 1) : 1;
+    const last = changes
+      ? Math.min(lineCount, Math.max(...changes.map((c) => c.range.startLineNumber + c.text.split("\n").length)) + 1)
+      : lineCount;
+    const kept = changes
+      ? (rtlLineDecosRef.current?.getRanges() ?? []).filter((range) => range.endLineNumber < first || range.startLineNumber > last)
+      : [];
+    const decos: { range: monaco.Range; options: monaco.editor.IModelDecorationOptions }[] = kept.map((range) => ({
+      range,
+      options: { inlineClassName: "rtl-line", stickiness: STICKINESS },
+    }));
+    for (let line = first; line <= last; line++) {
       const content = model.getLineContent(line);
       if (content.trim() && detectDirection(content) === "rtl") {
         decos.push({
@@ -305,11 +320,11 @@ export function Editor({ fileId, fileName }: EditorProps) {
       // RTL-line visuals; the shared save/bookmark-shrink bookkeeping lives
       // in noteModel.ts, registered once per note regardless of how many
       // views of it are open.
-      editor.onDidChangeModelContent(() => {
+      editor.onDidChangeModelContent((event) => {
         if (!noteState.loaded) return;
         const model = editor.getModel();
         if (!model) return;
-        refreshRtlLineDecorations(editor, model);
+        refreshRtlLineDecorations(editor, model, event.changes);
         refreshToolbarState();
       }),
       editor.onDidChangeCursorSelection(() => refreshToolbarState()),
@@ -418,8 +433,16 @@ export function Editor({ fileId, fileName }: EditorProps) {
         // autosave. Better to leave this note un-editable and unsaved than to
         // silently commit a guess that erases something we can't get back.
         editor.updateOptions({ readOnly: true });
+        const detail = String(e);
+        const classification = /operationerror|decrypt|authentication/i.test(detail)
+          ? "authentication failed; the note key may be incorrect or outdated"
+          : /malformed|bounds|record|trailer|length/i.test(detail)
+            ? "the stored record is malformed or incomplete"
+            : /json|syntax/i.test(detail)
+              ? "decryption succeeded, but the note data is not valid"
+              : "the note could not be read from storage";
         useVaultStore.setState({
-          error: `"${fileName}" could not be read (its stored data is corrupted). Editing is disabled for this note so nothing gets overwritten — the previous content may still be recoverable from a backup. Do not delete this note.`,
+          error: `"${fileName}" could not be opened: ${classification}. Editing is disabled so the current record cannot be overwritten. Keep the note and inspect a recovery-history revision.`,
         });
       });
     } else {

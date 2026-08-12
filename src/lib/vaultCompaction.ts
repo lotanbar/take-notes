@@ -20,9 +20,13 @@ export async function compactVaultTo(vault: VaultFile, oldPath: string, newPath:
     const contentRef = node.contentRef
       ? await appendVaultBlob(newPath, await readVaultBlob(oldPath, node.contentRef))
       : undefined;
+    const blobRefs: typeof node.blobRefs = [];
+    for (const ref of node.blobRefs ?? []) {
+      blobRefs.push(await appendVaultBlob(newPath, await readVaultBlob(oldPath, ref)));
+    }
     const children: TreeNode[] = [];
     for (const child of node.children) children.push(await rewriteNode(child));
-    return { ...node, contentRef, children };
+    return { ...node, contentRef, blobRefs: blobRefs.length ? blobRefs : undefined, children };
   }
 
   const tree = await rewriteNode(vault.tree);

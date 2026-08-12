@@ -42,7 +42,12 @@ export function readVaultBlob(path: string, ref: ContentRef): Promise<string> {
   // one cannot race an append: the new reference is exposed only after that
   // append completes. Keep reads outside the write/copy/history queue so note
   // loading never waits behind a large image save or whole-vault cloud copy.
-  return invoke<string>("read_vault_blob", { path, payloadOffset: ref.payloadOffset, length: ref.length });
+  return invoke<string>("read_vault_blob", {
+    path,
+    payloadOffset: ref.payloadOffset,
+    length: ref.length,
+    checksum: ref.checksum ?? null,
+  });
 }
 
 export function vaultCreateFresh(path: string): Promise<void> {

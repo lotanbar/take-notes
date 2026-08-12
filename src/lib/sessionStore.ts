@@ -16,6 +16,16 @@ function layoutKey(vaultPath: string): string {
   return `vault-notes:layout:${vaultPath}`;
 }
 
+const SHUTDOWN_KEY = "vault-notes:unfinishedShutdown";
+
+export type ClosePhase = "saving-notes" | "syncing-vault" | "updating-history" | "relocking-notes" | "closing";
+
+export interface UnfinishedShutdown {
+  vaultPath: string;
+  phase: ClosePhase;
+  startedAt: number;
+}
+
 interface StoredSession {
   keyB64: string;
 }
@@ -69,6 +79,34 @@ export function clearNodeSession(vaultPath: string, nodeId: string): void {
   const sessions = loadNodeSessions(vaultPath);
   delete sessions[nodeId];
   localStorage.setItem(nodeSessionsKey(vaultPath), JSON.stringify(sessions));
+}
+
+export function clearNodeSessions(vaultPath: string): void {
+  localStorage.removeItem(nodeSessionsKey(vaultPath));
+}
+
+export function recordUnfinishedShutdown(vaultPath: string, phase: ClosePhase): void {
+  const previous = readUnfinishedShutdown();
+  localStorage.setItem(SHUTDOWN_KEY, JSON.stringify({
+    vaultPath,
+    phase,
+    startedAt: previous?.vaultPath === vaultPath ? previous.startedAt : Date.now(),
+  } satisfies UnfinishedShutdown));
+}
+
+export function readUnfinishedShutdown(): UnfinishedShutdown | null {
+  const raw = localStorage.getItem(SHUTDOWN_KEY);
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw) as UnfinishedShutdown;
+    return typeof value.vaultPath === "string" && typeof value.phase === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearUnfinishedShutdown(): void {
+  localStorage.removeItem(SHUTDOWN_KEY);
 }
 
 // Remembers the open tabs / split layout across app relaunches (and across
