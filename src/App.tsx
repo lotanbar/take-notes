@@ -162,6 +162,36 @@ function App() {
     }
   }
 
+  function closeUnavailablePanels() {
+    const api = dockviewApiRef.current;
+    const state = useVaultStore.getState();
+    if (!api || !state.vault) return;
+    for (const panel of [...api.panels]) {
+      const params = panel.params as NotePanelParams;
+      const node = findNode(state.vault.tree, params.fileId);
+      if (!node || params.mirror || (node.locked && !state.sessionUnlockedIds.has(node.id))) panel.api.close();
+    }
+  }
+
+  function restoreLayoutIfReady() {
+    const api = dockviewApiRef.current;
+    const path = useVaultStore.getState().syncPath;
+    if (!api || !path || restoredForPathRef.current === path) return;
+    restoredForPathRef.current = path;
+    const saved = loadLayout(path);
+    if (saved) {
+      try {
+        api.fromJSON(saved as Parameters<typeof api.fromJSON>[0]);
+      } catch (e) {
+        console.error("Failed to restore previous tab layout, starting empty:", e);
+        api.clear();
+      }
+    }
+    syncPanelsToTree();
+    closeUnavailablePanels();
+    saveLayout(path, api.toJSON());
+  }
+
   function scheduleSaveLayout() {
     if (!syncPath) return;
     if (layoutSaveTimerRef.current) clearTimeout(layoutSaveTimerRef.current);
@@ -183,25 +213,16 @@ function App() {
       const node = findNode(state.vault.tree, params.fileId);
       if (node) void state.openFile(node);
     });
+    // Auto-open can resolve before Dockview mounts. Restore here as well as
+    // in the syncPath effect so either ordering produces the same tabs.
+    restoreLayoutIfReady();
   }
 
   // Restores the previous session's tabs/layout once per vault open (not on
   // every render), then drops any panels for files deleted/moved away while
   // the vault was closed.
   useEffect(() => {
-    const api = dockviewApiRef.current;
-    if (!api || !syncPath || restoredForPathRef.current === syncPath) return;
-    restoredForPathRef.current = syncPath;
-    const saved = loadLayout(syncPath);
-    if (saved) {
-      try {
-        api.fromJSON(saved as Parameters<typeof api.fromJSON>[0]);
-      } catch (e) {
-        console.error("Failed to restore previous tab layout, starting empty:", e);
-        api.clear();
-      }
-      syncPanelsToTree();
-    }
+    restoreLayoutIfReady();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [syncPath]);
 
@@ -214,14 +235,7 @@ function App() {
   // Relocking a note is transactional in the store. Once its key is gone,
   // remove every primary/duplicate view so no stale editor remains visible.
   useEffect(() => {
-    const api = dockviewApiRef.current;
-    const currentVault = useVaultStore.getState().vault;
-    if (!api || !currentVault) return;
-    for (const panel of [...api.panels]) {
-      const params = panel.params as NotePanelParams;
-      const node = findNode(currentVault.tree, params.fileId);
-      if (node?.locked && !sessionUnlockedIds.has(node.id)) panel.api.close();
-    }
+    closeUnavailablePanels();
   }, [sessionUnlockedIds]);
 
   // Opens (or focuses, if already open) a tab whenever the "requested active
