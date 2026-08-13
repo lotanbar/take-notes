@@ -672,7 +672,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
           pending: null,
           passwordError: null,
           activeFileId: pending.destination?.fileId ?? get().activeFileId,
-          activeBookmarkId: pending.destination?.bookmarkId ?? get().activeBookmarkId,
+          activeBookmarkId: pending.destination ? pending.destination.bookmarkId : get().activeBookmarkId,
         });
       } catch {
         set({ passwordError: "Incorrect password." });
@@ -889,7 +889,11 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       return;
     }
 
-    set({ pending: { kind: "node-unlock", id, destination }, passwordError: null });
+    // Unlocking a file from its padlock button has no explicit navigation
+    // destination. Treat the file itself as the destination so a successful
+    // password submission opens it immediately, just like clicking its name.
+    const unlockDestination = destination ?? (node.type === "file" ? { fileId: id, bookmarkId: null } : undefined);
+    set({ pending: { kind: "node-unlock", id, destination: unlockDestination }, passwordError: null });
   },
 
   removeNodeLock: async (id) => {
