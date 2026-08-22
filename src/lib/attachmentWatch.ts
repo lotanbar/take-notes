@@ -4,6 +4,7 @@ import { openPath } from "@tauri-apps/plugin-opener";
 import { useVaultStore } from "../store/vaultStore";
 import type { Attachment } from "../types/vault";
 import { MAX_ATTACHMENT_BYTES } from "./attachmentOps";
+import { withChangedAttachments } from "./attachmentRevision";
 
 type AttachmentUpdateHandler = (attachmentId: string, dataB64: string, size: number) => void;
 
@@ -49,7 +50,7 @@ async function applyFallbackSave(fileId: string, attachmentId: string, dataB64: 
     const content = await store.loadNodeContent(fileId);
     if (!content) return;
     const next = content.attachments.map((a) => (a.id === attachmentId ? { ...a, data: dataB64, size } : a));
-    await store.saveNodeContentRaw(fileId, { ...content, attachments: next });
+    await store.saveNodeContentRaw(fileId, withChangedAttachments(content, next));
   });
 }
 

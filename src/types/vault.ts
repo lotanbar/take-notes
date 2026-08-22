@@ -22,6 +22,10 @@ export interface TreeNode {
   // v3 immutable attachment/image records. Kept in the unencrypted header so
   // compaction can preserve locked notes without requiring their passwords.
   blobRefs?: ContentRef[];
+  // Mirrors the attachment snapshot stored in this node's encrypted content.
+  // Text-only saves must never move this backwards, otherwise a stale editor
+  // can replace a newer attachment with older bytes.
+  attachmentRevision?: number;
 }
 
 export interface BookmarkIndexEntry {
@@ -101,4 +105,5 @@ export interface NodeContent {
   links: LinkRange[];
   attachments: Attachment[];
   inlineImages: InlineImage[];
+  attachmentRevision?: number;
 }

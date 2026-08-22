@@ -20,6 +20,7 @@ import { useVaultStore } from "../store/vaultStore";
 import { useZoomStore } from "../store/zoomStore";
 import { isLinkBroken } from "../lib/bookmarkOps";
 import { fileToAttachment, MAX_ATTACHMENT_BYTES } from "../lib/attachmentOps";
+import { withChangedAttachments } from "../lib/attachmentRevision";
 import {
   openAndWatchAttachment,
   registerAttachmentUpdateHandler,
@@ -211,7 +212,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
       const next = noteState.attachments.map((a) => (a.id === attachmentId ? { ...a, data: dataB64, size } : a));
       noteState.attachments = next;
       if (mountedRef.current) setAttachments(next);
-      noteState.latestContent = { ...noteState.latestContent, attachments: next };
+      noteState.latestContent = withChangedAttachments(noteState.latestContent, next);
       flushSaveNow(fileId);
     });
 
@@ -377,7 +378,14 @@ export function Editor({ fileId, fileName }: EditorProps) {
           noteState.linkMeta = [];
           setLinkDecorations(noteState, []);
           noteState.prevBookmarkWidths = new Map();
-          noteState.latestContent = { text: model.getValue(), bookmarks: [], links: [], attachments, inlineImages };
+          noteState.latestContent = {
+            text: model.getValue(),
+            bookmarks: [],
+            links: [],
+            attachments,
+            inlineImages,
+            attachmentRevision: result?.attachmentRevision ?? 0,
+          };
           noteState.loaded = true;
           activateInlineImageOptimizations(noteState);
           refreshRtlLineDecorations(editor, model);
@@ -385,7 +393,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
           return;
         }
 
-        const content = result ?? { text: "", bookmarks: [], links: [], attachments: [], inlineImages: [] };
+        const content = result ?? { text: "", bookmarks: [], links: [], attachments: [], inlineImages: [], attachmentRevision: 0 };
         model.setValue(content.text);
 
         const index = useVaultStore.getState().vault?.index ?? {};
@@ -641,9 +649,11 @@ export function Editor({ fileId, fileName }: EditorProps) {
     await useVaultStore.getState().runExclusive(fileId, async () => {
       const newAttachments = await Promise.all(accepted.map(fileToAttachment));
       const next = [...noteState.attachments, ...newAttachments];
+      const nextContent = withChangedAttachments(noteState.latestContent, next);
       noteState.attachments = next;
+      noteState.latestContent = nextContent;
       if (mountedRef.current) setAttachments(next);
-      await useVaultStore.getState().saveNodeContentRaw(fileId, { ...noteState.latestContent, attachments: next });
+      await useVaultStore.getState().saveNodeContentRaw(fileId, nextContent);
     });
   }
 
@@ -651,6 +661,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
     const noteState = noteStateRef.current;
     if (!pendingDeleteAttachment || !noteState) return;
     const next = noteState.attachments.filter((a) => a.id !== pendingDeleteAttachment.id);
+    noteState.latestContent = withChangedAttachments(noteState.latestContent, next);
     noteState.attachments = next;
     setAttachments(next);
     flushSaveNow(fileId);

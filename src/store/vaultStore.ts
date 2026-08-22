@@ -37,6 +37,7 @@ import { compactVaultTo, compactVaultInPlace } from "../lib/vaultCompaction";
 import { stopAllAttachmentWatches } from "../lib/attachmentWatch";
 import { getDeviceId } from "../lib/deviceId";
 import { convertTiptapDocToPlainText, type LegacyNode } from "../editor/legacyMigration";
+import { preserveNewerAttachments } from "../lib/attachmentRevision";
 import {
   getLastVaultPath,
   setLastVaultPath,
@@ -99,6 +100,47 @@ function parseOpenResult(result: VaultOpenResult): { raw: VaultFile | LegacyVaul
     return { raw, legacy: false };
   }
   return { raw: JSON.parse(result.contents) as LegacyVaultFile, legacy: true };
+}
+
+async function decryptNodeContent(
+  filePath: string,
+  node: TreeNode,
+  masterKey: CryptoKey,
+  nodeKeys: Map<string, CryptoKey>,
+): Promise<NodeContent | null> {
+  if (!node.contentRef) return null;
+  const raw = await readVaultBlob(filePath, node.contentRef);
+  let payload = raw;
+  if (node.locked) {
+    const nodeKey = nodeKeys.get(node.id);
+    if (!nodeKey) return null;
+    try {
+      payload = await decryptFromB64(nodeKey, raw);
+    } catch {
+      // Some older locked notes were never wrapped with the node key.
+      payload = raw;
+    }
+  }
+  const plaintext = await decryptFromB64(masterKey, payload);
+  const parsed = JSON.parse(plaintext);
+  const attachmentRevision = Math.max(parsed?.attachmentRevision ?? 0, node.attachmentRevision ?? 0);
+
+  if (parsed && typeof parsed.text === "string") {
+    return {
+      text: parsed.text,
+      bookmarks: parsed.bookmarks ?? [],
+      links: parsed.links ?? [],
+      attachments: (parsed.attachments ?? []) as Attachment[],
+      inlineImages: (parsed.inlineImages ?? []) as InlineImage[],
+      attachmentRevision,
+    };
+  }
+
+  const legacyDoc: LegacyNode | undefined = parsed?.type === "doc" ? parsed : parsed?.doc;
+  const legacyAttachments = (parsed?.type === "doc" ? [] : parsed?.attachments ?? []) as Attachment[];
+  if (!legacyDoc) return null;
+  const migrated = convertTiptapDocToPlainText(legacyDoc);
+  return { ...migrated, attachments: legacyAttachments, inlineImages: [], attachmentRevision };
 }
 
 // `syncPath` is the cloud-facing path the user actually picked (what's shown
@@ -988,7 +1030,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const legacyAttachments = (parsed?.type === "doc" ? [] : parsed?.attachments ?? []) as Attachment[];
     if (!legacyDoc) return null;
     const migrated = convertTiptapDocToPlainText(legacyDoc);
-    return { ...migrated, attachments: legacyAttachments, inlineImages: [] };
+    return { ...migrated, attachments: legacyAttachments, inlineImages: [], attachmentRevision: node.attachmentRevision ?? 0 };
   },
 
   saveNodeContentRaw: async (id, content) => {
@@ -1011,13 +1053,20 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       if (await readVaultBlob(filePath, blobRef) !== stored) throw new Error(`verification failed for ${asset.id}`);
       return { ...asset, data: "", blobRef };
     };
+    let contentToSave = content;
+    const storedAttachmentRevision = node.attachmentRevision ?? 0;
+    if ((content.attachmentRevision ?? 0) < storedAttachmentRevision) {
+      const currentContent = await decryptNodeContent(filePath, node, masterKey, nodeKeys);
+      if (!currentContent) return;
+      contentToSave = preserveNewerAttachments(content, currentContent);
+    }
     const storedContent: NodeContent = {
-      ...content,
+      ...contentToSave,
       attachments: [],
       inlineImages: [],
     };
-    for (const attachment of content.attachments) storedContent.attachments.push(await persistAsset(attachment));
-    for (const image of content.inlineImages) storedContent.inlineImages.push(await persistAsset(image));
+    for (const attachment of contentToSave.attachments) storedContent.attachments.push(await persistAsset(attachment));
+    for (const image of contentToSave.inlineImages) storedContent.inlineImages.push(await persistAsset(image));
     let payload = await encryptToB64(masterKey, JSON.stringify(storedContent));
     if (node.locked) {
       payload = await encryptToB64(nodeKey!, payload);
@@ -1054,7 +1103,13 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const blobRefs = [...storedContent.attachments, ...storedContent.inlineImages]
       .map((asset) => asset.blobRef)
       .filter((ref): ref is NonNullable<typeof ref> => !!ref);
-    const nextTree = applyToNode(latestVault.tree, id, (n) => ({ ...n, contentRef, blobRefs, modifiedAt: Date.now() }));
+    const nextTree = applyToNode(latestVault.tree, id, (n) => ({
+      ...n,
+      contentRef,
+      blobRefs,
+      attachmentRevision: contentToSave.attachmentRevision ?? 0,
+      modifiedAt: Date.now(),
+    }));
     set({ vault: { ...latestVault, version: 3, tree: nextTree }, dirty: true });
     });
   },

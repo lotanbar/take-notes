@@ -53,11 +53,16 @@ pub fn start_attachment_watch(app: AppHandle, watch_id: String, path: String) ->
             Ok(events) => events,
             Err(_) => return,
         };
-        let touched = events.iter().any(|e| e.path == emit_target);
-        if !touched {
+        // Each attachment gets its own private temp directory. React to any
+        // event in that directory: Office applications commonly save through
+        // a temporary file followed by a rename, so the event path is not
+        // guaranteed to equal the final target even though its bytes changed.
+        if events.is_empty() {
             return;
         }
-        let Some(bytes) = read_with_retry(&emit_target) else { return };
+        let Some(bytes) = read_with_retry(&emit_target) else {
+            return;
+        };
         let data_b64 = general_purpose::STANDARD.encode(&bytes);
         let _ = app.emit(
             "attachment-file-changed",

@@ -29,7 +29,7 @@ export interface LinkMeta {
   broken: boolean;
 }
 
-const EMPTY_CONTENT: NodeContent = { text: "", bookmarks: [], links: [], attachments: [], inlineImages: [] };
+const EMPTY_CONTENT: NodeContent = { text: "", bookmarks: [], links: [], attachments: [], inlineImages: [], attachmentRevision: 0 };
 
 export interface NoteModelState {
   fileId: string;
