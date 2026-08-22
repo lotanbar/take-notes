@@ -1,0 +1,14 @@
+This portable package includes a custom build of FFmpeg 8.1.2.
+
+FFmpeg is licensed under the GNU Lesser General Public License version 2.1
+or later. This build does not enable GPL components. FFmpeg source for the
+exact bundled version is available at:
+
+https://github.com/FFmpeg/FFmpeg/tree/n8.1.2
+
+Enabled external libraries:
+- Alliance for Open Media libaom (BSD 2-Clause License)
+- Xiph.Org libopus (BSD 3-Clause License)
+
+The FFmpeg executable is a separate offline conversion tool invoked by the
+application. It is not loaded or linked into the application process.

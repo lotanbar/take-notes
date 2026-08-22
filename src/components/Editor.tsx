@@ -21,6 +21,7 @@ import { useZoomStore } from "../store/zoomStore";
 import { isLinkBroken } from "../lib/bookmarkOps";
 import { fileToAttachment, MAX_ATTACHMENT_BYTES } from "../lib/attachmentOps";
 import { withChangedAttachments } from "../lib/attachmentRevision";
+import { enqueueAttachmentOptimization } from "../lib/attachmentOptimization";
 import {
   openAndWatchAttachment,
   registerAttachmentUpdateHandler,
@@ -654,6 +655,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
       noteState.latestContent = nextContent;
       if (mountedRef.current) setAttachments(next);
       await useVaultStore.getState().saveNodeContentRaw(fileId, nextContent);
+      for (const attachment of newAttachments) enqueueAttachmentOptimization(fileId, attachment);
     });
   }
 

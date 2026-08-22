@@ -1,8 +1,12 @@
+mod atomic_file;
 mod attachment_watch;
 mod attachments;
 mod clipboard;
+mod compression;
 mod history;
 mod image_optimization;
+mod journal;
+mod media_optimization;
 mod vault;
 
 use tauri::Manager;
@@ -38,18 +42,31 @@ pub fn run() {
             vault::backup_vault_file,
             vault::finalize_vault_write,
             vault::vault_file_exists,
+            vault::vault_file_size,
             vault::copy_file_atomic,
+            vault::copy_file_atomic_verified,
             vault::resolve_live_vault_path,
             history::history_status,
             history::history_initialize,
             history::history_checkpoint,
+            history::history_verify_integrity,
+            history::history_restore,
+            history::history_migrate,
+            history::history_maintenance,
             clipboard::read_native_clipboard,
+            compression::compress_note,
+            compression::decompress_note,
+            compression::benchmark_note_compression,
             image_optimization::optimize_inline_image,
             image_optimization::cancel_inline_image_optimization,
             image_optimization::pending_image_write,
             image_optimization::pending_image_list,
             image_optimization::pending_image_read,
             image_optimization::pending_image_delete,
+            journal::journal_write,
+            journal::journal_read,
+            journal::journal_clear,
+            media_optimization::optimize_media,
             attachments::write_temp_attachment,
             attachments::save_attachment_to_path,
             attachment_watch::start_attachment_watch,

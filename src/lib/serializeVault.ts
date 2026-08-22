@@ -1,30 +1,16 @@
-import type { VaultFile } from "../types/vault";
+import type { VaultFile, VaultHeaderV4 } from "../types/vault";
+import { encryptToB64 } from "../crypto/crypto";
 
-// The vault (including every note's encrypted content and any base64 attachments)
-// is one JSON blob, and JSON.stringify-ing all of it on every autosave is CPU work
-// that would otherwise block the UI thread — typing/scrolling would stall for as
-// long as it takes. Doing it in a worker keeps that off the main thread.
-let worker: Worker | null = null;
-let nextId = 0;
-const pending = new Map<number, (json: string) => void>();
-
-function getWorker(): Worker {
-  if (!worker) {
-    worker = new Worker(new URL("./vaultSerialize.worker.ts", import.meta.url), { type: "module" });
-    worker.onmessage = (e: MessageEvent<{ id: number; json: string }>) => {
-      const resolve = pending.get(e.data.id);
-      if (!resolve) return;
-      pending.delete(e.data.id);
-      resolve(e.data.json);
+export async function serializeVault(vault: VaultFile, key?: CryptoKey): Promise<string> {
+  if (vault.version >= 4) {
+    if (!key) throw new Error("A master key is required to encrypt a v4 vault manifest.");
+    const header: VaultHeaderV4 = {
+      version: 4,
+      salt: vault.salt,
+      kdf: { algorithm: "PBKDF2-SHA256", iterations: 250_000 },
+      encryptedManifest: await encryptToB64(key, JSON.stringify(vault)),
     };
+    return JSON.stringify(header);
   }
-  return worker;
-}
-
-export function serializeVault(vault: VaultFile): Promise<string> {
-  return new Promise((resolve) => {
-    const id = nextId++;
-    pending.set(id, resolve);
-    getWorker().postMessage({ id, vault });
-  });
+  return JSON.stringify(vault);
 }

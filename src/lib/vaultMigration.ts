@@ -17,10 +17,10 @@ const PRE_MIGRATION_BACKUP_SUFFIX = ".pre-v2-backup";
 // given tempPath at a time; a second caller just awaits the first's result.
 const inFlightMigrations = new Map<string, Promise<VaultFile>>();
 
-export function migrateLegacyVault(path: string, legacy: LegacyVaultFile): Promise<VaultFile> {
+export function migrateLegacyVault(path: string, legacy: LegacyVaultFile, key: CryptoKey): Promise<VaultFile> {
   const existing = inFlightMigrations.get(path);
   if (existing) return existing;
-  const promise = migrateLegacyVaultInner(path, legacy).finally(() => {
+  const promise = migrateLegacyVaultInner(path, legacy, key).finally(() => {
     inFlightMigrations.delete(path);
   });
   inFlightMigrations.set(path, promise);
@@ -33,7 +33,7 @@ export function migrateLegacyVault(path: string, legacy: LegacyVaultFile): Promi
 // time, so this works uniformly for locked and unlocked nodes alike, without
 // needing any node passwords. Writes to a temp file and only swaps it in via
 // atomic rename once fully written; the original is preserved as a backup.
-async function migrateLegacyVaultInner(path: string, legacy: LegacyVaultFile): Promise<VaultFile> {
+async function migrateLegacyVaultInner(path: string, legacy: LegacyVaultFile, key: CryptoKey): Promise<VaultFile> {
   const tempPath = `${path}${MIGRATION_TEMP_SUFFIX}`;
   await vaultCreateFresh(tempPath);
 
@@ -47,7 +47,7 @@ async function migrateLegacyVaultInner(path: string, legacy: LegacyVaultFile): P
 
   const tree = await migrateNode(legacy.tree);
   const migrated: VaultFile = {
-    version: 2,
+    version: 4,
     salt: legacy.salt,
     masterCheck: legacy.masterCheck,
     tree,
@@ -56,7 +56,7 @@ async function migrateLegacyVaultInner(path: string, legacy: LegacyVaultFile): P
     deviceId: getDeviceId(),
   };
 
-  const headerJson = await serializeVault(migrated);
+  const headerJson = await serializeVault(migrated, key);
   await writeVaultHeader(tempPath, headerJson);
 
   await backupVaultFile(path, PRE_MIGRATION_BACKUP_SUFFIX);

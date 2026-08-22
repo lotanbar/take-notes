@@ -6,9 +6,11 @@ export type HistoryState = "ready" | "missing" | "corrupt" | "path_mismatch";
 export interface HistoryStatus {
   status: HistoryState;
   repositoryPath: string;
-  mirrorRepositoryPath: string;
   detail: string | null;
+  commitCount: number;
 }
+
+export interface HistoryMigrationReport { repositoryPath: string; importedRevisions: number; deletedPaths: string[]; reclaimedBytes: number }
 
 // The v2 container format (src-tauri/src/vault.rs) is append-only: every write
 // truncates off just the trailing 24-byte trailer and appends fresh bytes.
@@ -82,6 +84,10 @@ export function copyFileAtomic(sourcePath: string, destPath: string): Promise<vo
   return enqueue(() => invoke<void>("copy_file_atomic", { sourcePath, destPath }));
 }
 
+export function copyFileAtomicVerified(sourcePath: string, destPath: string): Promise<void> {
+  return enqueue(() => invoke<void>("copy_file_atomic_verified", { sourcePath, destPath }));
+}
+
 export function historyStatus(sourcePath: string): Promise<HistoryStatus> {
   return invoke<HistoryStatus>("history_status", { sourcePath });
 }
@@ -93,3 +99,9 @@ export function historyInitialize(sourcePath: string, vaultPath: string): Promis
 export function historyCheckpoint(sourcePath: string, vaultPath: string, reason: string): Promise<boolean> {
   return enqueue(() => invoke<boolean>("history_checkpoint", { sourcePath, vaultPath, reason }));
 }
+export function vaultFileSize(path: string): Promise<number> { return invoke<number>("vault_file_size", { path }); }
+
+export function historyVerifyIntegrity(sourcePath: string): Promise<HistoryStatus> { return invoke("history_verify_integrity", { sourcePath }); }
+export function historyRestore(sourcePath: string, commitId: string, destinationPath: string): Promise<void> { return enqueue(() => invoke("history_restore", { sourcePath, commitId, destinationPath })); }
+export function historyMigrate(sourcePath: string, vaultPath: string): Promise<HistoryMigrationReport> { return enqueue(() => invoke("history_migrate", { sourcePath, vaultPath })); }
+export function historyMaintenance(sourcePath: string): Promise<void> { return enqueue(() => invoke("history_maintenance", { sourcePath })); }

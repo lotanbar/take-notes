@@ -90,6 +90,7 @@ fn open_rw(path: &str) -> Result<File, String> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
         .map_err(|e| e.to_string())
 }
@@ -97,7 +98,8 @@ fn open_rw(path: &str) -> Result<File, String> {
 fn append_record(file: &mut File, tag: u8, payload: &[u8]) -> Result<u64, String> {
     let offset = compute_append_offset(file)?;
     file.set_len(offset).map_err(|e| e.to_string())?;
-    file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| e.to_string())?;
     let mut record = Vec::with_capacity(RECORD_PREFIX_LEN as usize + payload.len());
     record.push(tag);
     record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -107,8 +109,10 @@ fn append_record(file: &mut File, tag: u8, payload: &[u8]) -> Result<u64, String
 }
 
 fn write_trailer(file: &mut File, header_offset: u64, version: u64) -> Result<(), String> {
-    file.write_all(&header_offset.to_le_bytes()).map_err(|e| e.to_string())?;
-    file.write_all(&version.to_le_bytes()).map_err(|e| e.to_string())?;
+    file.write_all(&header_offset.to_le_bytes())
+        .map_err(|e| e.to_string())?;
+    file.write_all(&version.to_le_bytes())
+        .map_err(|e| e.to_string())?;
     file.write_all(TRAILER_MAGIC).map_err(|e| e.to_string())
 }
 
@@ -126,14 +130,17 @@ pub fn open_vault_file(path: String) -> Result<VaultOpenResult, String> {
         if &magic == FILE_MAGIC {
             let (header_offset, _version) = read_trailer(&mut file, file_len)
                 .ok_or_else(|| "vault file is corrupt (missing trailer)".to_string())?;
-            file.seek(SeekFrom::Start(header_offset)).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::Start(header_offset))
+                .map_err(|e| e.to_string())?;
             let mut prefix = [0u8; RECORD_PREFIX_LEN as usize];
             file.read_exact(&mut prefix).map_err(|e| e.to_string())?;
             if prefix[0] != b'H' {
                 return Err("vault file is corrupt (bad header record)".to_string());
             }
             let payload_len = u64::from_le_bytes(
-                prefix[1..9].try_into().map_err(|_| "corrupt length field".to_string())?,
+                prefix[1..9]
+                    .try_into()
+                    .map_err(|_| "corrupt length field".to_string())?,
             );
             let mut payload = vec![0u8; payload_len as usize];
             file.read_exact(&mut payload).map_err(|e| e.to_string())?;
@@ -187,20 +194,35 @@ pub fn vault_write_header(path: String, header_json: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn read_vault_blob(path: String, payload_offset: u64, length: u64, checksum: Option<String>) -> Result<String, String> {
+pub fn read_vault_blob(
+    path: String,
+    payload_offset: u64,
+    length: u64,
+    checksum: Option<String>,
+) -> Result<String, String> {
     let mut file = File::open(&path).map_err(|e| e.to_string())?;
     let file_len = file.metadata().map_err(|e| e.to_string())?.len();
-    if payload_offset < RECORD_PREFIX_LEN || length > file_len || payload_offset > file_len.saturating_sub(length) {
+    if payload_offset < RECORD_PREFIX_LEN
+        || length > file_len
+        || payload_offset > file_len.saturating_sub(length)
+    {
         return Err("vault record is malformed (blob reference is out of bounds)".into());
     }
-    file.seek(SeekFrom::Start(payload_offset - RECORD_PREFIX_LEN)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(payload_offset - RECORD_PREFIX_LEN))
+        .map_err(|e| e.to_string())?;
     let mut prefix = [0u8; RECORD_PREFIX_LEN as usize];
-    file.read_exact(&mut prefix).map_err(|_| "vault record is malformed (missing blob prefix)".to_string())?;
-    let stored_length = u64::from_le_bytes(prefix[1..9].try_into().map_err(|_| "vault record is malformed (bad length)".to_string())?);
+    file.read_exact(&mut prefix)
+        .map_err(|_| "vault record is malformed (missing blob prefix)".to_string())?;
+    let stored_length = u64::from_le_bytes(
+        prefix[1..9]
+            .try_into()
+            .map_err(|_| "vault record is malformed (bad length)".to_string())?,
+    );
     if prefix[0] != b'B' || stored_length != length {
         return Err("vault record is malformed (blob tag or length mismatch)".into());
     }
-    file.seek(SeekFrom::Start(payload_offset)).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(payload_offset))
+        .map_err(|e| e.to_string())?;
     let mut buf = vec![0u8; length as usize];
     file.read_exact(&mut buf).map_err(|e| e.to_string())?;
     if let Some(expected) = checksum {
@@ -226,7 +248,11 @@ pub fn vault_create_fresh(path: String) -> Result<(), String> {
 // in different folders don't collide) — never dropped next to the vault
 // itself, which just clutters whatever folder the user keeps their notes in.
 #[tauri::command]
-pub fn backup_vault_file(app: tauri::AppHandle, path: String, suffix: String) -> Result<(), String> {
+pub fn backup_vault_file(
+    app: tauri::AppHandle,
+    path: String,
+    _suffix: String,
+) -> Result<(), String> {
     let mut dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     dir.push("vault-backups");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -238,19 +264,34 @@ pub fn backup_vault_file(app: tauri::AppHandle, path: String, suffix: String) ->
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
 
-    dir.push(format!("{stem}-{:016x}{suffix}", hasher.finish()));
-    std::fs::copy(&path, &dir).map_err(|e| e.to_string())?;
+    dir.push(format!(
+        "{stem}-{:016x}.last-known-good.vlt",
+        hasher.finish()
+    ));
+    let temp = dir.with_extension("tmp");
+    std::fs::copy(&path, &temp).map_err(|e| e.to_string())?;
+    if dir.exists() {
+        std::fs::remove_file(&dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&temp, &dir).map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 pub fn finalize_vault_write(temp_path: String, target_path: String) -> Result<(), String> {
-    std::fs::rename(&temp_path, &target_path).map_err(|e| e.to_string())
+    crate::atomic_file::replace(Path::new(&temp_path), Path::new(&target_path))
 }
 
 #[tauri::command]
 pub fn vault_file_exists(path: String) -> bool {
     std::fs::metadata(&path).is_ok()
+}
+
+#[tauri::command]
+pub fn vault_file_size(path: String) -> Result<u64, String> {
+    std::fs::metadata(path)
+        .map(|value| value.len())
+        .map_err(|e| e.to_string())
 }
 
 // The local-only "live" copy each device keeps for a given cloud-facing vault
@@ -274,9 +315,35 @@ pub fn copy_file_atomic(source_path: String, dest_path: String) -> Result<(), St
             .write(true)
             .open(&tmp_path)
             .map_err(|e| format!("reopening temp file for fsync failed: {e}"))?;
-        f.sync_all().map_err(|e| format!("fsync of temp file failed: {e}"))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync of temp file failed: {e}"))?;
     }
-    std::fs::rename(&tmp_path, &dest_path).map_err(|e| format!("rename over destination failed: {e}"))?;
+    crate::atomic_file::replace(Path::new(&tmp_path), Path::new(&dest_path))
+        .map_err(|e| format!("rename over destination failed: {e}"))?;
+    Ok(())
+}
+
+fn file_hash(path: &str) -> Result<[u8; 32], String> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(digest.finalize().into())
+}
+
+#[tauri::command]
+pub fn copy_file_atomic_verified(source_path: String, dest_path: String) -> Result<(), String> {
+    let source_hash = file_hash(&source_path)?;
+    copy_file_atomic(source_path, dest_path.clone())?;
+    if file_hash(&dest_path)? != source_hash {
+        return Err("published vault checksum mismatch".into());
+    }
     Ok(())
 }
 
@@ -310,7 +377,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> String {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let mut p = std::env::temp_dir();
         p.push(format!("vault-notes-test-{name}-{nanos}.vlt"));
         p.to_string_lossy().to_string()
@@ -337,7 +407,13 @@ mod tests {
             VaultOpenResult::Legacy { .. } => panic!("expected v2"),
         }
 
-        let blob_b64 = read_vault_blob(path.clone(), loc.payload_offset, loc.length, Some(loc.checksum)).unwrap();
+        let blob_b64 = read_vault_blob(
+            path.clone(),
+            loc.payload_offset,
+            loc.length,
+            Some(loc.checksum),
+        )
+        .unwrap();
         assert_eq!(unb64(&blob_b64), "hello note content");
 
         std::fs::remove_file(&path).ok();
@@ -368,15 +444,39 @@ mod tests {
         }
 
         assert_eq!(
-            unb64(&read_vault_blob(path.clone(), loc_a.payload_offset, loc_a.length, Some(loc_a.checksum)).unwrap()),
+            unb64(
+                &read_vault_blob(
+                    path.clone(),
+                    loc_a.payload_offset,
+                    loc_a.length,
+                    Some(loc_a.checksum)
+                )
+                .unwrap()
+            ),
             "note A content"
         );
         assert_eq!(
-            unb64(&read_vault_blob(path.clone(), loc_b.payload_offset, loc_b.length, Some(loc_b.checksum)).unwrap()),
+            unb64(
+                &read_vault_blob(
+                    path.clone(),
+                    loc_b.payload_offset,
+                    loc_b.length,
+                    Some(loc_b.checksum)
+                )
+                .unwrap()
+            ),
             "note B content"
         );
         assert_eq!(
-            unb64(&read_vault_blob(path.clone(), loc_a2.payload_offset, loc_a2.length, Some(loc_a2.checksum)).unwrap()),
+            unb64(
+                &read_vault_blob(
+                    path.clone(),
+                    loc_a2.payload_offset,
+                    loc_a2.length,
+                    Some(loc_a2.checksum)
+                )
+                .unwrap()
+            ),
             "note A edited content"
         );
 
@@ -413,7 +513,9 @@ mod tests {
         std::fs::write(&path, r#"{"version":1,"tree":{}}"#).unwrap();
 
         match open_vault_file(path.clone()).unwrap() {
-            VaultOpenResult::Legacy { contents } => assert_eq!(contents, r#"{"version":1,"tree":{}}"#),
+            VaultOpenResult::Legacy { contents } => {
+                assert_eq!(contents, r#"{"version":1,"tree":{}}"#)
+            }
             VaultOpenResult::V2 { .. } => panic!("expected legacy"),
         }
 
@@ -452,7 +554,15 @@ mod tests {
             VaultOpenResult::Legacy { .. } => panic!("expected v2"),
         }
         assert_eq!(
-            unb64(&read_vault_blob(path.clone(), loc.payload_offset, loc.length, Some(loc.checksum)).unwrap()),
+            unb64(
+                &read_vault_blob(
+                    path.clone(),
+                    loc.payload_offset,
+                    loc.length,
+                    Some(loc.checksum)
+                )
+                .unwrap()
+            ),
             "new vault's note"
         );
 
@@ -498,5 +608,20 @@ mod tests {
 
         std::fs::remove_file(&source).ok();
         std::fs::remove_file(&dest).ok();
+    }
+
+    #[test]
+    fn verified_copy_matches_source_bytes() {
+        let source = temp_path("verified-copy-source");
+        let destination = temp_path("verified-copy-destination");
+        std::fs::write(&source, b"verified vault bytes").unwrap();
+        std::fs::write(&destination, b"old bytes that must be replaced").unwrap();
+        copy_file_atomic_verified(source.clone(), destination.clone()).unwrap();
+        assert_eq!(
+            file_hash(&source).unwrap(),
+            file_hash(&destination).unwrap()
+        );
+        std::fs::remove_file(source).ok();
+        std::fs::remove_file(destination).ok();
     }
 }

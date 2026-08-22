@@ -251,6 +251,9 @@ export function removeInlineImage(state: NoteModelState, id: string): void {
 }
 
 function scheduleFlush(state: NoteModelState) {
+  void useVaultStore.getState().journalNodeContent(state.fileId, contentForSave(state)).catch((error) => {
+    useVaultStore.setState({ error: `Session recovery write failed: ${String(error)}` });
+  });
   if (state.saveTimer) clearTimeout(state.saveTimer);
   state.saveTimer = setTimeout(() => flushSave(state), SAVE_DEBOUNCE_MS);
 }

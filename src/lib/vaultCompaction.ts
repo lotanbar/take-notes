@@ -13,7 +13,7 @@ import {
 // the dead space left behind by edits/removed attachments since the last
 // compaction). Used for "Save As" — since it has to produce a complete,
 // valid file at a new path anyway, that's the natural point to compact.
-export async function compactVaultTo(vault: VaultFile, oldPath: string, newPath: string): Promise<VaultFile> {
+export async function compactVaultTo(vault: VaultFile, oldPath: string, newPath: string, key: CryptoKey): Promise<VaultFile> {
   await vaultCreateFresh(newPath);
 
   async function rewriteNode(node: TreeNode): Promise<TreeNode> {
@@ -31,7 +31,7 @@ export async function compactVaultTo(vault: VaultFile, oldPath: string, newPath:
 
   const tree = await rewriteNode(vault.tree);
   const compacted: VaultFile = { ...vault, tree };
-  const headerJson = await serializeVault(compacted);
+  const headerJson = await serializeVault(compacted, key);
   await writeVaultHeader(newPath, headerJson);
   return compacted;
 }
@@ -52,19 +52,19 @@ const inFlightCompactions = new Map<string, Promise<VaultFile>>();
 // rewrite), then atomically swaps the temp file in via rename. Called
 // automatically on lock/close so users who never touch "Save As" still get
 // their dead space (superseded edits, deleted notes/attachments) reclaimed.
-export function compactVaultInPlace(vault: VaultFile, path: string): Promise<VaultFile> {
+export function compactVaultInPlace(vault: VaultFile, path: string, key: CryptoKey): Promise<VaultFile> {
   const existing = inFlightCompactions.get(path);
   if (existing) return existing;
-  const promise = compactVaultInPlaceInner(vault, path).finally(() => {
+  const promise = compactVaultInPlaceInner(vault, path, key).finally(() => {
     inFlightCompactions.delete(path);
   });
   inFlightCompactions.set(path, promise);
   return promise;
 }
 
-async function compactVaultInPlaceInner(vault: VaultFile, path: string): Promise<VaultFile> {
+async function compactVaultInPlaceInner(vault: VaultFile, path: string, key: CryptoKey): Promise<VaultFile> {
   const tempPath = `${path}${COMPACTION_TEMP_SUFFIX}`;
-  const compacted = await compactVaultTo(vault, path, tempPath);
+  const compacted = await compactVaultTo(vault, path, tempPath, key);
   await backupVaultFile(path, PRE_COMPACT_BACKUP_SUFFIX);
   await finalizeVaultWrite(tempPath, path);
   return compacted;

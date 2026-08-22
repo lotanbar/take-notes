@@ -12,14 +12,27 @@ import {
   type NoteModelState,
 } from "./noteModel";
 
-const MINIMUM_SAVINGS_RATIO = 0.10;
+const MINIMUM_SAVINGS_RATIO = 0;
 const ENCODING_GRACE_MS = 1000;
 const OPTIMIZABLE_MIME_TYPES = new Set([
   "image/png",
   "image/jpeg",
   "image/jpg",
   "image/webp",
+  "image/gif",
+  "image/apng",
 ]);
+const ANIMATED_MIME_TYPES = new Set(["image/gif", "image/apng"]);
+function encodedSize(value: string): number { return Uint8Array.from(atob(value), (character) => character.charCodeAt(0)).length; }
+async function hashB64(value: string): Promise<string> { return [...new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(atob(value), (character) => character.charCodeAt(0))))].map((byte) => byte.toString(16).padStart(2, "0")).join(""); }
+function isAnimatedImage(image: InlineImage): boolean {
+  if (ANIMATED_MIME_TYPES.has(image.mimeType.toLowerCase())) return true;
+  if (image.mimeType.toLowerCase() === "image/webp") {
+    try { const header = atob(image.data.slice(0, 4096)); return header.includes("ANIM") || header.includes("ANMF"); } catch { return false; }
+  }
+  if (image.mimeType.toLowerCase() !== "image/png") return false;
+  try { return atob(image.data.slice(0, 4096)).includes("acTL"); } catch { return false; }
+}
 
 export type InlineImageOptimizationStatus = "securing" | "queued" | "encoding" | "waiting" | "failed";
 
@@ -164,11 +177,21 @@ async function commitReplacement(job: OptimizationJob, replacement: InlineImage)
 }
 
 async function finishJob(job: OptimizationJob, optimized: NativeOptimizedImage): Promise<void> {
-  const worthwhile = optimized.size <= Math.floor(job.source.size * (1 - MINIMUM_SAVINGS_RATIO));
-  if (!worthwhile && !job.recoveryStored) return;
+  const targetCodec = isAnimatedImage(job.source) ? "av1-webm-720p15" : "avif-q35";
+  const worthwhile = optimized.size + optimized.mimeType.length + targetCodec.length < Math.floor(job.source.size * (1 - MINIMUM_SAVINGS_RATIO)) + job.source.mimeType.length + "original".length;
+  const data = worthwhile ? optimized.data : job.source.data;
+  const codec = worthwhile ? targetCodec : "original";
+  const compression = {
+    codec: codec as "av1-webm-720p15" | "avif-q35" | "original",
+    profileVersion: 1,
+    sourceHash: await hashB64(job.source.data),
+    outputHash: await hashB64(data),
+    sourceSize: job.source.size || encodedSize(job.source.data),
+    outputSize: worthwhile ? optimized.size : (job.source.size || encodedSize(job.source.data)),
+  };
   const replacement: InlineImage = worthwhile
-    ? { ...job.source, mimeType: optimized.mimeType, size: optimized.size, data: optimized.data, pendingOptimization: false }
-    : { ...job.source, pendingOptimization: false };
+    ? { ...job.source, mimeType: optimized.mimeType, size: optimized.size, data, pendingOptimization: false, compressionState: "processed", originalMimeType: job.source.mimeType, compression }
+    : { ...job.source, pendingOptimization: false, compressionState: "processed", originalMimeType: job.source.mimeType, compression };
   const committed = await commitReplacement(job, replacement);
   if (committed && job.recoveryStored) {
     await invoke("pending_image_delete", { vaultKey: job.vaultKey, imageId: job.imageId });
@@ -184,10 +207,9 @@ async function processQueue(): Promise<void> {
     if (!jobs.has(imageId) || cancelledIds.has(imageId) || job.token !== vaultToken) continue;
     setStatus(imageId, "encoding");
     try {
-      const optimized = await invoke<NativeOptimizedImage>("optimize_inline_image", {
-        data: job.source.data,
-        imageId,
-      });
+      const optimized = isAnimatedImage(job.source)
+        ? await invoke<{ data: string; mimeType: string; outputSize: number }>("optimize_media", { data: job.source.data, mimeType: isAnimatedImage(job.source) && job.source.mimeType === "image/png" ? "image/apng" : job.source.mimeType }).then((result) => ({ ...result, size: result.outputSize, width: job.source.width, height: job.source.height }))
+        : await invoke<NativeOptimizedImage>("optimize_inline_image", { data: job.source.data, imageId });
       if (cancelledIds.has(imageId) || job.token !== vaultToken) continue;
       await finishJob(job, optimized);
       jobs.delete(imageId);
@@ -218,7 +240,7 @@ export async function stageInlineImageOptimization(state: NoteModelState, image:
   const vaultKey = useVaultStore.getState().vault?.salt;
   if (!vaultKey) throw new Error("Open a vault before pasting a screenshot.");
   resetForVault(vaultKey);
-  const pendingImage = { ...image, pendingOptimization: true };
+  const pendingImage = { ...image, pendingOptimization: true, compressionState: "pending" as const };
   setStatus(image.id, "securing");
   addInlineImage(state, pendingImage);
   try {
@@ -298,7 +320,7 @@ export function queueExistingInlineImages(state: NoteModelState): void {
   resetForVault(vaultKey);
   for (const source of getInlineImages(state)) {
     if (
-      source.pendingOptimization
+      !source.pendingOptimization
       || source.mimeType === "image/avif"
       || !OPTIMIZABLE_MIME_TYPES.has(source.mimeType.toLowerCase())
       || !source.data
@@ -347,7 +369,7 @@ export async function scanVaultForExistingImages(): Promise<void> {
       if (!content || token !== vaultToken) continue;
       for (const source of content.inlineImages) {
         if (
-          source.pendingOptimization
+          !source.pendingOptimization
           || source.mimeType === "image/avif"
           || !OPTIMIZABLE_MIME_TYPES.has(source.mimeType.toLowerCase())
           || !source.data
@@ -395,4 +417,8 @@ export async function waitForInlineImageOptimizations(): Promise<void> {
   if (snapshot.pendingCount > 0) {
     throw new Error("Some screenshots could not finish and will resume the next time the vault is opened.");
   }
+}
+
+export async function retryInlineImageOptimizations(): Promise<void> {
+  await initializeInlineImageOptimizations(currentVaultKey);
 }

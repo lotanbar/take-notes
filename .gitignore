@@ -10,6 +10,9 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+artifacts
+__pycache__/
+*.pyc
 *.local
 
 # Editor directories and files
@@ -20,6 +23,7 @@ dist-ssr
 
 # Vault data files — personal notes, never belong in the repo
 *.vlt*
+src-tauri/tools/*.exe
 *.suo
 *.ntvs*
 *.njsproj

@@ -17,13 +17,16 @@ import {
   recordUnfinishedShutdown,
   saveLayout,
   type ClosePhase,
+  type ShutdownProgress,
 } from "./lib/sessionStore";
 import {
   getInlineImageOptimizationSnapshot,
   initializeInlineImageOptimizations,
   subscribeInlineImageOptimizations,
   waitForInlineImageOptimizations,
+  retryInlineImageOptimizations,
 } from "./editor/inlineImageOptimization";
+import { getAttachmentOptimizationSnapshot, initializeAttachmentOptimizations, retryFailedAttachmentOptimizations, subscribeAttachmentOptimizations, waitForAttachmentOptimizations } from "./lib/attachmentOptimization";
 import "dockview-react/dist/styles/dockview.css";
 import "./App.css";
 
@@ -32,6 +35,9 @@ const DOCKVIEW_COMPONENTS = { note: EditorPanel };
 const LAYOUT_SAVE_DEBOUNCE_MS = 500;
 const CLOSE_LABELS: Record<ClosePhase, string> = {
   "saving-notes": "Saving notes…",
+  "optimizing-media": "Optimizing pending media…",
+  "rebuilding-vault": "Rebuilding the current vault…",
+  "verifying-vault": "Verifying encrypted data…",
   "syncing-vault": "Syncing vault…",
   "updating-history": "Updating recovery history…",
   "relocking-notes": "Relocking notes…",
@@ -41,6 +47,7 @@ const CLOSE_LABELS: Record<ClosePhase, string> = {
 interface CloseStatus {
   phase: ClosePhase;
   error?: string;
+  progress?: ShutdownProgress;
 }
 
 function EmptyWatermark() {
@@ -91,22 +98,25 @@ function App() {
     getInlineImageOptimizationSnapshot,
     getInlineImageOptimizationSnapshot,
   );
+  const attachmentOptimizationSnapshot = useSyncExternalStore(subscribeAttachmentOptimizations, getAttachmentOptimizationSnapshot, getAttachmentOptimizationSnapshot);
+  const totalPendingOptimizations = optimizationSnapshot.pendingCount + attachmentOptimizationSnapshot.pendingCount;
 
-  async function finishClose(): Promise<void> {
+  async function finishClose(preserveJournal = false): Promise<void> {
     if (closeProceedingRef.current) return;
     closeProceedingRef.current = true;
     setShowOptimizationCloseWarning(false);
     const closingPath = useVaultStore.getState().syncPath;
     let currentPhase: ClosePhase = "saving-notes";
-    const updatePhase = (phase: ClosePhase) => {
+    const updatePhase = (progress: ShutdownProgress) => {
+      const phase = progress.phase;
       currentPhase = phase;
-      setCloseStatus({ phase });
+      setCloseStatus({ phase, progress });
       if (closingPath) recordUnfinishedShutdown(closingPath, phase);
     };
-    updatePhase("saving-notes");
+    updatePhase({ phase: "saving-notes" });
     try {
-      await useVaultStore.getState().flushForExit(updatePhase);
-      updatePhase("relocking-notes");
+      await useVaultStore.getState().flushForExit(updatePhase, preserveJournal);
+      updatePhase({ phase: "relocking-notes" });
       if (closingPath) clearNodeSessions(closingPath);
       const api = dockviewApiRef.current;
       if (api) {
@@ -118,24 +128,42 @@ function App() {
         }
         if (closingPath) saveLayout(closingPath, api.toJSON());
       }
-      updatePhase("closing");
+      updatePhase({ phase: "closing" });
       clearUnfinishedShutdown();
       await getCurrentWindow().destroy();
     } catch (closeError) {
       closeProceedingRef.current = false;
-      setCloseStatus({ phase: currentPhase, error: String(closeError) });
+      const message = String(closeError);
+      if (message.includes("PENDING_MEDIA_PASSWORD_REQUIRED")) setCloseStatus(null);
+      else setCloseStatus({ phase: currentPhase, error: message });
     }
+  }
+
+  async function closeAnyway(): Promise<void> {
+    closeProceedingRef.current = true;
+    const closingPath = useVaultStore.getState().syncPath;
+    if (closingPath) recordUnfinishedShutdown(closingPath, closeStatus?.phase ?? "saving-notes");
+    await getCurrentWindow().destroy();
   }
 
   async function waitAndClose(): Promise<void> {
     setWaitingForOptimizations(true);
+    setCloseStatus({ phase: "optimizing-media" });
     try {
-      await waitForInlineImageOptimizations();
+      await Promise.all([waitForInlineImageOptimizations(), waitForAttachmentOptimizations()]);
       await finishClose();
     } catch (optimizationError) {
       useVaultStore.setState({ error: String(optimizationError) });
       setWaitingForOptimizations(false);
+      setCloseStatus({ phase: "optimizing-media", error: String(optimizationError) });
     }
+  }
+
+  async function retryAndClose(): Promise<void> {
+    retryFailedAttachmentOptimizations();
+    await retryInlineImageOptimizations();
+    setCloseStatus(null);
+    await waitAndClose();
   }
 
   // Keeps every open panel in sync with the tree. Deleted files lose their
@@ -287,6 +315,7 @@ function App() {
     void initializeInlineImageOptimizations(vault?.salt ?? null).catch((optimizationError) => {
       console.error("Could not initialize screenshot optimization:", optimizationError);
     });
+    void initializeAttachmentOptimizations().catch((optimizationError) => console.error("Could not initialize attachment optimization:", optimizationError));
   }, [vault?.salt, sessionUnlockedIds]);
 
   useEffect(() => {
@@ -295,7 +324,13 @@ function App() {
     void getCurrentWindow().onCloseRequested((event) => {
       event.preventDefault();
       if (closeProceedingRef.current) return;
-      if (getInlineImageOptimizationSnapshot().pendingCount > 0) {
+      const state = useVaultStore.getState();
+      const lockedPending = state.vault && flattenTree(state.vault.tree).find((node) => node.locked && (node.pendingMediaCount ?? 0) > 0 && !state.sessionUnlockedIds.has(node.id));
+      if (lockedPending) {
+        void state.toggleNodeLock(lockedPending.id);
+        return;
+      }
+      if (getInlineImageOptimizationSnapshot().pendingCount + getAttachmentOptimizationSnapshot().pendingCount > 0) {
         setShowOptimizationCloseWarning(true);
         return;
       }
@@ -384,7 +419,7 @@ function App() {
           {pending?.kind === "history-init" && (
             <ConfirmDialog
               title="Recovery history required"
-              message={`This vault requires two synchronized local Git recovery histories:\n${pending.history.repositoryPath}\n${pending.history.mirrorRepositoryPath}`}
+              message={`This vault requires one local incremental Git recovery history:\n${pending.history.repositoryPath}`}
               actions={[{ label: "Create History", onClick: () => void initializeHistory() }]}
               onCancel={cancelHistory}
             />
@@ -452,9 +487,9 @@ function App() {
         {showOptimizationCloseWarning && (
           <ConfirmDialog
             title="Screenshots are still optimizing"
-            message={`${optimizationSnapshot.pendingCount} screenshot${optimizationSnapshot.pendingCount === 1 ? " is" : "s are"} still being optimized. You can wait, or quit safely and resume next time.`}
+            message={`${totalPendingOptimizations} media item${totalPendingOptimizations === 1 ? " is" : "s are"} still being optimized. You can wait, or quit safely and resume next time.`}
             actions={[
-              { label: "Quit and resume later", onClick: () => void finishClose() },
+              { label: "Quit and resume later", onClick: () => void finishClose(true) },
               { label: waitingForOptimizations ? "Waiting…" : "Wait and close", onClick: () => void waitAndClose() },
             ]}
             onCancel={() => {
@@ -467,13 +502,19 @@ function App() {
             <div className="modal">
               <h2>Saving and closing…</h2>
               <p>{closeStatus.error ? `Close failed: ${closeStatus.error}` : CLOSE_LABELS[closeStatus.phase]}</p>
+              {closeStatus.progress?.beforeBytes !== undefined && closeStatus.progress.afterBytes !== undefined && (
+                <p>{`${(closeStatus.progress.beforeBytes / 1024 / 1024).toFixed(1)} MB → ${(closeStatus.progress.afterBytes / 1024 / 1024).toFixed(1)} MB; saved ${((closeStatus.progress.savedBytes ?? 0) / 1024 / 1024).toFixed(1)} MB`}</p>
+              )}
               {closeStatus.error && (
                 <div className="modal-actions">
                   <button type="button" onClick={() => { clearUnfinishedShutdown(); setCloseStatus(null); }}>
                     Cancel Close
                   </button>
-                  <button type="button" className="primary" onClick={() => void finishClose()}>
+                  <button type="button" className="primary" onClick={() => closeStatus.phase === "optimizing-media" ? void retryAndClose() : void finishClose()}>
                     Retry
+                  </button>
+                  <button type="button" onClick={() => void closeAnyway()}>
+                    Close anyway
                   </button>
                 </div>
               )}

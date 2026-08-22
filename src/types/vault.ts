@@ -8,6 +8,17 @@ export interface ContentRef {
   checksum?: string;
 }
 
+export type CompressionCodec = "none" | "deflate-9" | "brotli-11" | "zstd-22" | "lzma1-ultra" | "lzma2-ultra" | "avif-q35" | "opus-24k-mono" | "av1-webm-720p15" | "original";
+export type MediaCompressionState = "processed" | "pending" | "processing" | "failed";
+export interface CompressionMetadata {
+  codec: CompressionCodec;
+  profileVersion: number;
+  sourceHash: string;
+  outputHash: string;
+  sourceSize: number;
+  outputSize: number;
+}
+
 export interface TreeNode {
   id: string;
   type: NodeType;
@@ -26,6 +37,8 @@ export interface TreeNode {
   // Text-only saves must never move this backwards, otherwise a stale editor
   // can replace a newer attachment with older bytes.
   attachmentRevision?: number;
+  compression?: CompressionMetadata;
+  pendingMediaCount?: number;
 }
 
 export interface BookmarkIndexEntry {
@@ -50,6 +63,13 @@ export interface VaultFile {
   deviceId: string;
 }
 
+export interface VaultHeaderV4 {
+  version: 4;
+  salt: string;
+  kdf: { algorithm: "PBKDF2-SHA256"; iterations: number };
+  encryptedManifest: string;
+}
+
 // Pre-migration shape: content lived inline as a base64 ciphertext string
 // directly on the tree node instead of as a separate blob reference.
 export interface LegacyTreeNode extends Omit<TreeNode, "children" | "contentRef"> {
@@ -68,6 +88,9 @@ export interface Attachment {
   size: number;
   data: string; // populated at runtime; empty when persisted via blobRef
   blobRef?: ContentRef;
+  compressionState?: MediaCompressionState;
+  compression?: CompressionMetadata;
+  originalMimeType?: string;
 }
 
 export interface InlineImage {
@@ -83,6 +106,9 @@ export interface InlineImage {
   // encrypted local optimization spool. Runtime views replace `data` from
   // that spool; the large source image never enters the append-only vault.
   pendingOptimization?: boolean;
+  compressionState?: MediaCompressionState;
+  compression?: CompressionMetadata;
+  originalMimeType?: string;
 }
 
 export interface BookmarkRange {

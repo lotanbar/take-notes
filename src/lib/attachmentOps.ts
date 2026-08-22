@@ -21,6 +21,7 @@ export function fileToAttachment(file: File): Promise<Attachment> {
         mimeType: file.type || "application/octet-stream",
         size: file.size,
         data,
+        compressionState: /^(audio|video)\//i.test(file.type) || /^image\/(png|jpe?g|webp|gif|apng)$/i.test(file.type) ? "pending" : "processed",
       });
     };
     reader.onerror = () => reject(reader.error ?? new Error("Failed to read file"));

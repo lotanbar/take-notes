@@ -1,27 +1,26 @@
-use git2::{IndexAddOption, Repository, Signature, Time};
 use fs2::FileExt;
-use serde::Serialize;
+use git2::{IndexAddOption, Oid, Repository, Signature, Time};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 const SOURCE_FILE: &str = "SOURCE_PATH.txt";
-const VAULT_FILE: &str = "vault.vlt";
+const REVISION_FILE: &str = "revision.json";
 const RECOVERY_FILE: &str = "RECOVERY.md";
-
+const FILE_MAGIC: &[u8; 8] = b"VNVLTV02";
+const TRAILER_MAGIC: &[u8; 8] = b"VNTRLR02";
 static HISTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-// The Mutex serializes work inside one app process. The file lock covers a
-// second app instance (including a release build and `tauri dev`) using the
-// same vault at the same time.
 struct HistoryGuard {
-    _process_guard: MutexGuard<'static, ()>,
+    _process: MutexGuard<'static, ()>,
     file: File,
 }
-
 impl Drop for HistoryGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
@@ -33,443 +32,613 @@ impl Drop for HistoryGuard {
 pub struct HistoryStatus {
     status: String,
     repository_path: String,
-    mirror_repository_path: String,
     detail: Option<String>,
+    commit_count: usize,
 }
 
-struct RepoCheck {
-    status: String,
-    detail: Option<String>,
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationReport {
+    repository_path: String,
+    imported_revisions: usize,
+    deleted_paths: Vec<String>,
+    reclaimed_bytes: u64,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct RecordRef {
+    tag: u8,
+    hash: String,
+    length: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Revision {
+    format_version: u64,
+    records: Vec<RecordRef>,
+    source_vault_hash: String,
+    original_commit_id: Option<String>,
 }
 
 fn normalized_source(path: &str) -> String {
     let absolute = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
     let value = absolute.to_string_lossy().replace('/', "\\");
-    if cfg!(windows) { value.to_lowercase() } else { value }
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
+    }
 }
-
-fn history_dir(base: &Path, source_path: &str) -> PathBuf {
+fn safe_name(source_path: &str) -> String {
     let stem = Path::new(source_path)
         .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "vault".into());
-    let safe_stem: String = stem.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
-    let hash = format!("{:x}", Sha256::digest(normalized_source(source_path).as_bytes()));
-    base.join("vault-history").join(format!("{}-{}", safe_stem, &hash[..12]))
+        .unwrap_or_default()
+        .to_string_lossy();
+    let safe: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let hash = format!(
+        "{:x}",
+        Sha256::digest(normalized_source(source_path).as_bytes())
+    );
+    format!(
+        "{}-{}",
+        if safe.is_empty() { "vault" } else { &safe },
+        &hash[..12]
+    )
 }
-
-fn app_history_dirs(app: &tauri::AppHandle, source_path: &str) -> Result<(PathBuf, PathBuf), String> {
+fn repo_path(app: &tauri::AppHandle, source: &str) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("vault-recovery")
+        .join(safe_name(source)))
+}
+fn old_paths(app: &tauri::AppHandle, source: &str) -> Result<Vec<PathBuf>, String> {
     let local = app.path().app_local_data_dir().map_err(|e| e.to_string())?;
     let roaming = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok((history_dir(&local, source_path), history_dir(&roaming.join("secondary-history"), source_path)))
+    let mut result = Vec::new();
+    for root in [
+        local.join("vault-history"),
+        roaming.join("secondary-history").join("vault-history"),
+    ] {
+        if root.exists() {
+            for entry in fs::read_dir(&root).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                let recorded = fs::read_to_string(path.join(SOURCE_FILE)).unwrap_or_default();
+                if normalized_source(recorded.trim()) == normalized_source(source) {
+                    result.push(path);
+                }
+            }
+        }
+    }
+    Ok(result)
 }
 
-fn lock_history(app: &tauri::AppHandle, source_path: &str) -> Result<(PathBuf, PathBuf, HistoryGuard), String> {
-    let process_guard = HISTORY_LOCK.get_or_init(|| Mutex::new(())).lock()
-        .map_err(|_| "history lock poisoned".to_string())?;
-    let (primary, mirror) = app_history_dirs(app, source_path)?;
-    let parent = primary.parent().ok_or_else(|| "history has no parent directory".to_string())?;
-    fs::create_dir_all(parent).map_err(|e| format!("creating history lock directory failed: {e}"))?;
-    make_private(parent)?;
-    let lock_name = format!(".{}.lock", primary.file_name().unwrap_or_default().to_string_lossy());
-    let file = OpenOptions::new().create(true).read(true).write(true).open(parent.join(lock_name))
-        .map_err(|e| format!("opening history lock failed: {e}"))?;
-    file.lock_exclusive().map_err(|e| format!("locking recovery history failed: {e}"))?;
-    Ok((primary, mirror, HistoryGuard { _process_guard: process_guard, file }))
+fn lock(app: &tauri::AppHandle, source: &str) -> Result<(PathBuf, HistoryGuard), String> {
+    let process = HISTORY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "history lock poisoned")?;
+    let path = repo_path(app, source)?;
+    let parent = path.parent().ok_or("history path has no parent")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(parent.join(format!(".{}.lock", safe_name(source))))
+        .map_err(|e| e.to_string())?;
+    file.lock_exclusive().map_err(|e| e.to_string())?;
+    Ok((
+        path,
+        HistoryGuard {
+            _process: process,
+            file,
+        },
+    ))
+}
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+fn hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
-fn inspect(repo_path: &Path, source_path: &str) -> RepoCheck {
-    if !repo_path.exists() {
-        return RepoCheck { status: "missing".into(), detail: None };
+type VaultObjects = Vec<(String, Vec<u8>)>;
+
+fn parse_vault(
+    bytes: &[u8],
+    original_commit_id: Option<String>,
+) -> Result<(Revision, VaultObjects), String> {
+    if bytes.len() < 32 || &bytes[..8] != FILE_MAGIC || &bytes[bytes.len() - 8..] != TRAILER_MAGIC {
+        return Err("vault is not a valid object container".into());
     }
-    let repo = match Repository::open(repo_path) {
-        Ok(repo) => repo,
-        Err(e) => return RepoCheck { status: "corrupt".into(), detail: Some(e.to_string()) },
-    };
-    let recorded = match fs::read_to_string(repo_path.join(SOURCE_FILE)) {
-        Ok(value) => value.trim().to_string(),
-        Err(e) => return RepoCheck { status: "corrupt".into(), detail: Some(e.to_string()) },
-    };
-    if normalized_source(&recorded) != normalized_source(source_path) {
-        return RepoCheck { status: "path_mismatch".into(), detail: Some(recorded) };
+    let trailer = bytes.len() - 24;
+    let format_version = u64::from_le_bytes(
+        bytes[trailer + 8..trailer + 16]
+            .try_into()
+            .map_err(|_| "bad trailer")?,
+    );
+    let mut offset = 8usize;
+    let mut records = Vec::new();
+    let mut objects = Vec::new();
+    while offset < trailer {
+        if offset + 9 > trailer {
+            return Err("truncated vault record".into());
+        }
+        let tag = bytes[offset];
+        let length = u64::from_le_bytes(
+            bytes[offset + 1..offset + 9]
+                .try_into()
+                .map_err(|_| "bad record length")?,
+        ) as usize;
+        let end = offset + 9 + length;
+        if end > trailer || (tag != b'B' && tag != b'H') {
+            return Err("invalid vault record".into());
+        }
+        let payload = bytes[offset + 9..end].to_vec();
+        let digest = hash(&payload);
+        records.push(RecordRef {
+            tag,
+            hash: digest.clone(),
+            length: length as u64,
+        });
+        objects.push((digest, payload));
+        offset = end;
     }
-    let valid = repo.head().and_then(|h| h.peel_to_commit()).and_then(|c| c.tree()).is_ok()
-        && repo_path.join(VAULT_FILE).is_file()
-        && repo_path.join(RECOVERY_FILE).is_file();
-    if !valid {
-        return RepoCheck { status: "corrupt".into(), detail: Some("repository has no valid HEAD or required files".into()) };
+    if records.last().map(|r| r.tag) != Some(b'H') {
+        return Err("vault has no final manifest record".into());
     }
-    RepoCheck { status: "ready".into(), detail: None }
+    Ok((
+        Revision {
+            format_version,
+            records,
+            source_vault_hash: hash(bytes),
+            original_commit_id,
+        },
+        objects,
+    ))
 }
 
-fn inspect_pair(primary: &Path, mirror: &Path, source_path: &str) -> HistoryStatus {
-    let primary_check = inspect(primary, source_path);
-    if primary_check.status != "ready" {
-        return HistoryStatus { status: primary_check.status, repository_path: primary.to_string_lossy().into(), mirror_repository_path: mirror.to_string_lossy().into(), detail: primary_check.detail };
+fn write_snapshot(repo_path: &Path, bytes: &[u8], original: Option<String>) -> Result<(), String> {
+    let (revision, objects) = parse_vault(bytes, original)?;
+    let objects_dir = repo_path.join("objects");
+    fs::create_dir_all(&objects_dir).map_err(|e| e.to_string())?;
+    for (digest, data) in objects {
+        let target = objects_dir.join(&digest);
+        if !target.exists() {
+            let tmp = objects_dir.join(format!("{digest}.tmp"));
+            fs::write(&tmp, data).map_err(|e| e.to_string())?;
+            fs::rename(tmp, target).map_err(|e| e.to_string())?;
+        }
     }
-    let mirror_check = inspect(mirror, source_path);
-    if mirror_check.status != "ready" {
-        return HistoryStatus { status: mirror_check.status, repository_path: primary.to_string_lossy().into(), mirror_repository_path: mirror.to_string_lossy().into(), detail: mirror_check.detail.map(|d| format!("secondary history: {d}")) };
-    }
-    let primary_head = Repository::open(primary).and_then(|r| r.refname_to_id("HEAD")).ok();
-    let mirror_head = Repository::open(mirror).and_then(|r| r.refname_to_id("HEAD")).ok();
-    if primary_head.is_none() || primary_head != mirror_head {
-        return HistoryStatus { status: "corrupt".into(), repository_path: primary.to_string_lossy().into(), mirror_repository_path: mirror.to_string_lossy().into(), detail: Some("the two recovery histories are out of sync".into()) };
-    }
-    HistoryStatus { status: "ready".into(), repository_path: primary.to_string_lossy().into(), mirror_repository_path: mirror.to_string_lossy().into(), detail: None }
-}
-
-// A crash can occur after one repository advances HEAD but before the other
-// does. If one HEAD is a strict descendant of the other, there is no fork and
-// the ahead repository is an unambiguous source from which to rebuild the
-// lagging mirror. Unrelated/divergent histories are never auto-repaired.
-fn reconcile_pair(primary: &Path, mirror: &Path, source_path: &str) -> Result<HistoryStatus, String> {
-    let status = inspect_pair(primary, mirror, source_path);
-    if status.status != "corrupt" || status.detail.as_deref() != Some("the two recovery histories are out of sync") {
-        return Ok(status);
-    }
-    let primary_repo = Repository::open(primary).map_err(|e| e.to_string())?;
-    let mirror_repo = Repository::open(mirror).map_err(|e| e.to_string())?;
-    let primary_head = primary_repo.refname_to_id("HEAD").map_err(|e| e.to_string())?;
-    let mirror_head = mirror_repo.refname_to_id("HEAD").map_err(|e| e.to_string())?;
-
-    if primary_repo.graph_descendant_of(primary_head, mirror_head).unwrap_or(false) {
-        drop(primary_repo);
-        drop(mirror_repo);
-        seed_mirror(primary, mirror)?;
-    } else if mirror_repo.graph_descendant_of(mirror_head, primary_head).unwrap_or(false) {
-        drop(primary_repo);
-        drop(mirror_repo);
-        seed_mirror(mirror, primary)?;
-    } else {
-        return Ok(status);
-    }
-    Ok(inspect_pair(primary, mirror, source_path))
-}
-
-fn atomic_copy(source: &Path, destination: &Path) -> Result<(), String> {
-    let temp = destination.with_extension("vlt.tmp");
-    fs::copy(source, &temp).map_err(|e| format!("copying vault into history failed: {e}"))?;
-    fs::rename(&temp, destination).map_err(|e| format!("publishing history snapshot failed: {e}"))
+    fs::write(
+        repo_path.join(REVISION_FILE),
+        serde_json::to_vec_pretty(&revision).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn commit(repo: &Repository, message: &str, timestamp: i64) -> Result<bool, String> {
     let mut index = repo.index().map_err(|e| e.to_string())?;
-    index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None).map_err(|e| e.to_string())?;
+    index
+        .add_all(["*"], IndexAddOption::DEFAULT, None)
+        .map_err(|e| e.to_string())?;
     index.write().map_err(|e| e.to_string())?;
     let tree_id = index.write_tree().map_err(|e| e.to_string())?;
     let tree = repo.find_tree(tree_id).map_err(|e| e.to_string())?;
     let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
-    if parent.as_ref().map(|p| p.tree_id() == tree_id).unwrap_or(false) {
+    if parent.as_ref().is_some_and(|p| p.tree_id() == tree_id) {
         return Ok(false);
     }
-    let signature = Signature::new("Vault Notes", "local-history@vault-notes.invalid", &Time::new(timestamp, 0)).map_err(|e| e.to_string())?;
-    let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
-    repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &parents).map_err(|e| e.to_string())?;
-    maybe_pack(repo);
+    let sig = Signature::new(
+        "Vault Notes",
+        "local-history@vault-notes.invalid",
+        &Time::new(timestamp, 0),
+    )
+    .map_err(|e| e.to_string())?;
+    let parents: Vec<_> = parent.iter().collect();
+    repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+        .map_err(|e| e.to_string())?;
     Ok(true)
 }
-
-// Packing is maintenance only: a failure must never invalidate an otherwise
-// durable checkpoint. Loose objects remain valid and a later interval retries.
-fn maybe_pack(repo: &Repository) {
-    let count = repo.revwalk().and_then(|mut walk| {
-        walk.push_head()?;
-        Ok(walk.count())
-    }).unwrap_or(0);
-    if count == 0 || count % 50 != 0 { return; }
-    let result = (|| -> Result<(), git2::Error> {
-        let mut walk = repo.revwalk()?;
-        walk.push_head()?;
-        let mut builder = repo.packbuilder()?;
-        builder.insert_walk(&mut walk)?;
-        builder.write(&repo.path().join("objects").join("pack"), 0o600)
-    })();
-    let _ = result;
+fn init_repo(path: &Path, source: &str) -> Result<Repository, String> {
+    fs::create_dir_all(path).map_err(|e| e.to_string())?;
+    let repo = Repository::init(path).map_err(|e| e.to_string())?;
+    fs::write(
+        path.join(SOURCE_FILE),
+        format!("{}\n", normalized_source(source)),
+    )
+    .map_err(|e| e.to_string())?;
+    fs::write(path.join(RECOVERY_FILE), "# Vault recovery\n\nEach commit references a complete encrypted revision through revision.json and content-addressed objects. Use the app's restore command.\n").map_err(|e| e.to_string())?;
+    Ok(repo)
 }
 
-fn preserve_invalid(path: &Path) -> Result<(), String> {
-    if !path.exists() { return Ok(()); }
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    for suffix in 0..1000u16 {
-        let preserved = path.with_file_name(format!("{name}.preserved-{stamp}-{suffix}"));
-        if preserved.exists() { continue; }
-        return fs::rename(path, preserved).map_err(|e| format!("preserving invalid history failed: {e}"));
-    }
-    Err("preserving invalid history failed: could not allocate a unique destination".into())
+fn count(repo: &Repository) -> usize {
+    repo.revwalk()
+        .map(|mut w| {
+            let _ = w.push_head();
+            w.count()
+        })
+        .unwrap_or(0)
 }
-
-fn unix_timestamp() -> Result<i64, String> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_secs() as i64)
-}
-
-fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
-    fs::create_dir_all(destination).map_err(|e| e.to_string())?;
-    for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let target = destination.join(entry.file_name());
-        if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+fn inspect(path: &Path, source: &str) -> HistoryStatus {
+    let result = (|| -> Result<usize, String> {
+        let repo = Repository::open(path).map_err(|e| e.to_string())?;
+        let recorded = fs::read_to_string(path.join(SOURCE_FILE)).map_err(|e| e.to_string())?;
+        if normalized_source(recorded.trim()) != normalized_source(source) {
+            return Err("recovery repository belongs to a different vault".into());
         }
+        let head = repo
+            .head()
+            .and_then(|value| value.peel_to_commit())
+            .map_err(|e| e.to_string())?;
+        reconstruct(&repo, &head)?;
+        Ok(count(&repo))
+    })();
+    match result {
+        Ok(n) => HistoryStatus {
+            status: "ready".into(),
+            repository_path: path.to_string_lossy().into(),
+            detail: None,
+            commit_count: n,
+        },
+        Err(_e) if !path.exists() => HistoryStatus {
+            status: "missing".into(),
+            repository_path: path.to_string_lossy().into(),
+            detail: None,
+            commit_count: 0,
+        },
+        Err(e) => HistoryStatus {
+            status: "corrupt".into(),
+            repository_path: path.to_string_lossy().into(),
+            detail: Some(e),
+            commit_count: 0,
+        },
+    }
+}
+
+fn reconstruct(repo: &Repository, commit: &git2::Commit<'_>) -> Result<Vec<u8>, String> {
+    let tree = commit.tree().map_err(|e| e.to_string())?;
+    let revision_entry = tree
+        .get_path(Path::new(REVISION_FILE))
+        .map_err(|e| e.to_string())?;
+    let revision_blob = repo
+        .find_blob(revision_entry.id())
+        .map_err(|e| e.to_string())?;
+    let revision: Revision =
+        serde_json::from_slice(revision_blob.content()).map_err(|e| e.to_string())?;
+    let mut out = FILE_MAGIC.to_vec();
+    let mut header_offset = 0u64;
+    for record in revision.records {
+        let object_path = Path::new("objects").join(&record.hash);
+        let entry = tree.get_path(&object_path).map_err(|e| e.to_string())?;
+        let blob = repo.find_blob(entry.id()).map_err(|e| e.to_string())?;
+        if blob.content().len() as u64 != record.length || hash(blob.content()) != record.hash {
+            return Err("history object hash mismatch".into());
+        }
+        if record.tag == b'H' {
+            header_offset = out.len() as u64;
+        }
+        out.push(record.tag);
+        out.extend_from_slice(&record.length.to_le_bytes());
+        out.extend_from_slice(blob.content());
+    }
+    out.extend_from_slice(&header_offset.to_le_bytes());
+    out.extend_from_slice(&revision.format_version.to_le_bytes());
+    out.extend_from_slice(TRAILER_MAGIC);
+    if hash(&out) != revision.source_vault_hash {
+        return Err("reconstructed vault checksum mismatch".into());
+    }
+    Ok(out)
+}
+fn verify_repo(repo: &Repository) -> Result<(), String> {
+    let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+    walk.push_head().map_err(|e| e.to_string())?;
+    let mut found = false;
+    for oid in walk {
+        found = true;
+        let commit = repo
+            .find_commit(oid.map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+        reconstruct(repo, &commit)?;
+    }
+    if !found {
+        return Err("repository has no commits".into());
     }
     Ok(())
 }
 
-fn seed_mirror(primary: &Path, mirror: &Path) -> Result<(), String> {
-    preserve_invalid(mirror)?;
-    let parent = mirror.parent().ok_or_else(|| "secondary history has no parent directory".to_string())?;
-    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    make_private(parent)?;
-    let temporary = mirror.with_file_name(format!("{}.seeding", mirror.file_name().unwrap_or_default().to_string_lossy()));
-    if temporary.exists() { preserve_invalid(&temporary)?; }
-    copy_tree(primary, &temporary)?;
-    make_private(&temporary)?;
-    fs::rename(&temporary, mirror).map_err(|e| format!("publishing secondary history failed: {e}"))
-}
-
-#[cfg(unix)]
-fn make_private(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())
-}
-
-#[cfg(not(unix))]
-fn make_private(_path: &Path) -> Result<(), String> { Ok(()) }
-
-#[tauri::command]
-pub async fn history_status(app: tauri::AppHandle, source_path: String) -> Result<HistoryStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let (primary, mirror, _guard) = lock_history(&app, &source_path)?;
-        reconcile_pair(&primary, &mirror, &source_path)
-    })
-    .await
-    .map_err(|e| format!("history worker failed: {e}"))?
-}
-
-#[tauri::command]
-pub async fn history_initialize(app: tauri::AppHandle, source_path: String, vault_path: String) -> Result<HistoryStatus, String> {
-    tauri::async_runtime::spawn_blocking(move || history_initialize_blocking(app, source_path, vault_path))
-        .await
-        .map_err(|e| format!("history worker failed: {e}"))?
-}
-
-fn history_initialize_blocking(app: tauri::AppHandle, source_path: String, vault_path: String) -> Result<HistoryStatus, String> {
-    let (primary, mirror, _guard) = lock_history(&app, &source_path)?;
-    let existing = reconcile_pair(&primary, &mirror, &source_path)?;
-    if existing.status == "ready" {
-        return Ok(existing);
-    }
-    if inspect(&primary, &source_path).status == "ready" && inspect(&mirror, &source_path).status == "ready" {
-        return Err(existing.detail.unwrap_or_else(|| "recovery histories have diverged".into()));
-    }
-    if inspect(&primary, &source_path).status != "ready" {
-        if inspect(&mirror, &source_path).status == "ready" {
-            // The whole point of the mirror is that either side can rebuild
-            // the other without throwing away its history.
-            seed_mirror(&mirror, &primary)?;
-        } else {
-            preserve_invalid(&primary)?;
-            fs::create_dir_all(&primary).map_err(|e| e.to_string())?;
-            make_private(primary.parent().unwrap_or(&primary))?;
-            make_private(&primary)?;
-            let repo = Repository::init(&primary).map_err(|e| e.to_string())?;
-            fs::write(primary.join(SOURCE_FILE), format!("{}\n", normalized_source(&source_path))).map_err(|e| e.to_string())?;
-            fs::write(primary.join(RECOVERY_FILE), "# Vault recovery\n\nEach Git revision of `vault.vlt` is a complete encrypted vault snapshot. To recover, check out the desired revision and copy `vault.vlt` to the source path recorded in `SOURCE_PATH.txt`. Keep the original file until recovery is verified.\n").map_err(|e| e.to_string())?;
-            atomic_copy(Path::new(&vault_path), &primary.join(VAULT_FILE))?;
-            commit(&repo, "Initial vault backup", unix_timestamp()?)?;
+fn old_revisions(paths: &[PathBuf]) -> Vec<(i64, String, String, Vec<u8>)> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for path in paths {
+        let Ok(repo) = Repository::open(path) else {
+            continue;
+        };
+        let Ok(mut walk) = repo.revwalk() else {
+            continue;
+        };
+        if walk.push_head().is_err() {
+            continue;
+        }
+        for oid in walk.flatten() {
+            let Ok(commit) = repo.find_commit(oid) else {
+                continue;
+            };
+            let Ok(tree) = commit.tree() else { continue };
+            let Ok(entry) = tree.get_path(Path::new("vault.vlt")) else {
+                continue;
+            };
+            let Ok(blob) = repo.find_blob(entry.id()) else {
+                continue;
+            };
+            let digest = hash(blob.content());
+            if seen.insert(digest) {
+                result.push((
+                    commit.time().seconds(),
+                    commit
+                        .message()
+                        .unwrap_or("Imported recovery revision")
+                        .to_string(),
+                    oid.to_string(),
+                    blob.content().to_vec(),
+                ));
+            }
         }
     }
-    seed_mirror(&primary, &mirror)?;
-    let status = inspect_pair(&primary, &mirror, &source_path);
-    if status.status != "ready" { return Err(status.detail.unwrap_or_else(|| "history initialization failed validation".into())); }
-    Ok(status)
+    result.sort_by_key(|r| r.0);
+    result
+}
+fn dir_size(path: &Path) -> u64 {
+    if path.is_file() {
+        return path.metadata().map(|m| m.len()).unwrap_or(0);
+    }
+    fs::read_dir(path)
+        .map(|entries| entries.flatten().map(|e| dir_size(&e.path())).sum())
+        .unwrap_or(0)
+}
+
+fn migrate_locked(
+    app: &tauri::AppHandle,
+    source: &str,
+    vault_path: &str,
+    destination: &Path,
+) -> Result<MigrationReport, String> {
+    let old = old_paths(app, source)?;
+    let revisions = old_revisions(&old);
+    let temp = destination.with_extension("migrating");
+    if temp.exists() {
+        fs::remove_dir_all(&temp).map_err(|e| e.to_string())?;
+    }
+    let repo = init_repo(&temp, source)?;
+    let mut imported = 0;
+    for (timestamp, message, oid, bytes) in revisions {
+        write_snapshot(&temp, &bytes, Some(oid.clone()))?;
+        if commit(
+            &repo,
+            &format!("{message}\n\nOriginal-Commit-ID: {oid}"),
+            timestamp,
+        )? {
+            imported += 1;
+        }
+    }
+    let current = fs::read(vault_path).map_err(|e| e.to_string())?;
+    write_snapshot(&temp, &current, None)?;
+    if commit(&repo, "Current vault at history migration", now())? {
+        imported += 1;
+    }
+    verify_repo(&repo)?;
+    drop(repo);
+    if destination.exists() {
+        fs::remove_dir_all(destination).map_err(|e| e.to_string())?;
+    }
+    fs::rename(&temp, destination).map_err(|e| e.to_string())?;
+    let mut reclaimed = 0;
+    let mut deleted = Vec::new();
+    for path in old {
+        reclaimed += dir_size(&path);
+        fs::remove_dir_all(&path).map_err(|e| {
+            format!(
+                "verified migration succeeded but deleting {} failed: {e}",
+                path.display()
+            )
+        })?;
+        deleted.push(path.to_string_lossy().into());
+    }
+    Ok(MigrationReport {
+        repository_path: destination.to_string_lossy().into(),
+        imported_revisions: imported,
+        deleted_paths: deleted,
+        reclaimed_bytes: reclaimed,
+    })
 }
 
 #[tauri::command]
-pub async fn history_checkpoint(app: tauri::AppHandle, source_path: String, vault_path: String, reason: Option<String>) -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(move || history_checkpoint_blocking(app, source_path, vault_path, reason))
-        .await
-        .map_err(|e| format!("history worker failed: {e}"))?
+pub async fn history_status(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<HistoryStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, _guard) = lock(&app, &source_path)?;
+        Ok(inspect(&path, &source_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
-
-fn history_checkpoint_blocking(app: tauri::AppHandle, source_path: String, vault_path: String, reason: Option<String>) -> Result<bool, String> {
-    let (primary_path, mirror_path, _guard) = lock_history(&app, &source_path)?;
-    let status = reconcile_pair(&primary_path, &mirror_path, &source_path)?;
-    if status.status != "ready" { return Err(format!("history is {}: {}", status.status, status.detail.unwrap_or_default())); }
-    let primary = Repository::open(&primary_path).map_err(|e| e.to_string())?;
-    let mirror = Repository::open(&mirror_path).map_err(|e| e.to_string())?;
-    atomic_copy(Path::new(&vault_path), &primary_path.join(VAULT_FILE))?;
-    atomic_copy(Path::new(&vault_path), &mirror_path.join(VAULT_FILE))?;
-    let timestamp = unix_timestamp()?;
-    let message = reason.as_deref().unwrap_or("Vault checkpoint");
-    let changed = commit(&primary, message, timestamp)?;
-    let mirror_changed = commit(&mirror, message, timestamp)?;
-    let primary_head = primary.refname_to_id("HEAD").map_err(|e| e.to_string())?;
-    let mirror_head = mirror.refname_to_id("HEAD").map_err(|e| e.to_string())?;
-    if changed != mirror_changed || primary_head != mirror_head {
-        return Err("secondary recovery history did not produce the same commit".into());
-    }
-    Ok(changed)
+#[tauri::command]
+pub async fn history_initialize(
+    app: tauri::AppHandle,
+    source_path: String,
+    vault_path: String,
+) -> Result<HistoryStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, _guard) = lock(&app, &source_path)?;
+        if inspect(&path, &source_path).status != "ready" {
+            migrate_locked(&app, &source_path, &vault_path, &path)?;
+        }
+        Ok(inspect(&path, &source_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn history_checkpoint(
+    app: tauri::AppHandle,
+    source_path: String,
+    vault_path: String,
+    reason: Option<String>,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, _guard) = lock(&app, &source_path)?;
+        if inspect(&path, &source_path).status != "ready" {
+            return Err("recovery history is not ready".into());
+        }
+        let bytes = fs::read(vault_path).map_err(|e| e.to_string())?;
+        write_snapshot(&path, &bytes, None)?;
+        let repo = Repository::open(path).map_err(|e| e.to_string())?;
+        commit(
+            &repo,
+            reason.as_deref().unwrap_or("Vault checkpoint"),
+            now(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn history_verify_integrity(
+    app: tauri::AppHandle,
+    source_path: String,
+) -> Result<HistoryStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, _guard) = lock(&app, &source_path)?;
+        let repo = Repository::open(&path).map_err(|e| e.to_string())?;
+        verify_repo(&repo)?;
+        Ok(inspect(&path, &source_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn history_restore(
+    app: tauri::AppHandle,
+    source_path: String,
+    commit_id: String,
+    destination_path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, _guard) = lock(&app, &source_path)?;
+        let repo = Repository::open(path).map_err(|e| e.to_string())?;
+        let oid = Oid::from_str(&commit_id).map_err(|e| e.to_string())?;
+        let commit = repo.find_commit(oid).map_err(|e| e.to_string())?;
+        let bytes = reconstruct(&repo, &commit)?;
+        let temp = format!("{destination_path}.restore.tmp");
+        let mut file = File::create(&temp).map_err(|e| e.to_string())?;
+        file.write_all(&bytes).map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        crate::atomic_file::replace(Path::new(&temp), Path::new(&destination_path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn history_migrate(
+    app: tauri::AppHandle,
+    source_path: String,
+    vault_path: String,
+) -> Result<MigrationReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, _guard) = lock(&app, &source_path)?;
+        migrate_locked(&app, &source_path, &vault_path, &path)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+pub async fn history_maintenance(app: tauri::AppHandle, source_path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, _guard) = lock(&app, &source_path)?;
+        let repo = Repository::open(path).map_err(|e| e.to_string())?;
+        let mut walk = repo.revwalk().map_err(|e| e.to_string())?;
+        walk.push_head().map_err(|e| e.to_string())?;
+        let mut pack = repo.packbuilder().map_err(|e| e.to_string())?;
+        pack.insert_walk(&mut walk).map_err(|e| e.to_string())?;
+        pack.write(&repo.path().join("objects").join("pack"), 0o600)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        std::env::temp_dir().join(format!("vault-history-test-{name}-{stamp}"))
+    fn container(blobs: &[&[u8]], header: &[u8]) -> Vec<u8> {
+        let mut bytes = FILE_MAGIC.to_vec();
+        for payload in blobs {
+            bytes.push(b'B');
+            bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(payload);
+        }
+        let header_offset = bytes.len() as u64;
+        bytes.push(b'H');
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&header_offset.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(TRAILER_MAGIC);
+        bytes
     }
-
-    fn make_ready(root: &Path, source: &Path, bytes: &[u8]) -> Repository {
-        fs::create_dir_all(root).unwrap();
-        fs::write(source, bytes).unwrap();
-        let repo = Repository::init(root).unwrap();
-        fs::write(root.join(SOURCE_FILE), format!("{}\n", normalized_source(&source.to_string_lossy()))).unwrap();
-        fs::write(root.join(RECOVERY_FILE), "recovery").unwrap();
-        atomic_copy(source, &root.join(VAULT_FILE)).unwrap();
-        assert!(commit(&repo, "initial", 1_700_000_000).unwrap());
-        repo
+    #[test]
+    fn parses_and_rejects_corruption() {
+        let mut bytes = FILE_MAGIC.to_vec();
+        let payload = b"{}";
+        bytes.push(b'H');
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        let header = 8u64;
+        bytes.extend_from_slice(&header.to_le_bytes());
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(TRAILER_MAGIC);
+        assert!(parse_vault(&bytes, None).is_ok());
+        bytes[8] = b'X';
+        assert!(parse_vault(&bytes, None).is_err());
     }
 
     #[test]
-    fn path_is_stable_and_distinguishes_same_names() {
-        let base = Path::new("history-root");
-        assert_eq!(history_dir(base, "C:\\one\\notes.vlt"), history_dir(base, "C:\\one\\notes.vlt"));
-        assert_ne!(history_dir(base, "C:\\one\\notes.vlt"), history_dir(base, "C:\\two\\notes.vlt"));
-    }
-
-    #[test]
-    fn validates_ownership_and_repository_integrity() {
-        let parent = temp_dir("validation");
-        fs::create_dir_all(&parent).unwrap();
-        let source = parent.join("source.vlt");
-        let repo_path = parent.join("repo");
-        let repo = make_ready(&repo_path, &source, b"initial encrypted bytes");
-        assert_eq!(inspect(&repo_path, &source.to_string_lossy()).status, "ready");
-
-        fs::write(repo_path.join(SOURCE_FILE), "some-other-vault.vlt\n").unwrap();
-        assert_eq!(inspect(&repo_path, &source.to_string_lossy()).status, "path_mismatch");
-        drop(repo);
-        fs::remove_dir_all(repo_path.join(".git")).unwrap();
-        assert_eq!(inspect(&repo_path, &source.to_string_lossy()).status, "corrupt");
-        fs::remove_dir_all(&parent).unwrap();
-    }
-
-    #[test]
-    fn checkpoints_changed_bytes_only() {
-        let parent = temp_dir("checkpoint");
-        fs::create_dir_all(&parent).unwrap();
-        let source = parent.join("source.vlt");
-        let repo_path = parent.join("repo");
-        let repo = make_ready(&repo_path, &source, b"version one");
-        assert!(!commit(&repo, "unchanged", 1_700_000_001).unwrap());
-        fs::write(&source, b"version two with attachment bytes").unwrap();
-        atomic_copy(&source, &repo_path.join(VAULT_FILE)).unwrap();
-        assert!(commit(&repo, "switch", 1_700_000_002).unwrap());
-        assert_eq!(fs::read(repo_path.join(VAULT_FILE)).unwrap(), b"version two with attachment bytes");
-        assert!(!commit(&repo, "unchanged again", 1_700_000_003).unwrap());
-        drop(repo);
-        fs::remove_dir_all(&parent).unwrap();
-    }
-
-    #[test]
-    fn mirrored_repositories_produce_identical_commits() {
-        let parent = temp_dir("mirror");
-        fs::create_dir_all(&parent).unwrap();
-        let source = parent.join("source.vlt");
-        let primary_path = parent.join("primary");
-        let mirror_path = parent.join("mirror");
-        let primary = make_ready(&primary_path, &source, b"version one");
-        drop(primary);
-        seed_mirror(&primary_path, &mirror_path).unwrap();
-
-        fs::write(&source, b"version two").unwrap();
-        atomic_copy(&source, &primary_path.join(VAULT_FILE)).unwrap();
-        atomic_copy(&source, &mirror_path.join(VAULT_FILE)).unwrap();
-        let primary = Repository::open(&primary_path).unwrap();
-        let mirror = Repository::open(&mirror_path).unwrap();
-        assert!(commit(&primary, "checkpoint", 1_700_000_100).unwrap());
-        assert!(commit(&mirror, "checkpoint", 1_700_000_100).unwrap());
-        assert_eq!(primary.refname_to_id("HEAD").unwrap(), mirror.refname_to_id("HEAD").unwrap());
-        assert_eq!(inspect_pair(&primary_path, &mirror_path, &source.to_string_lossy()).status, "ready");
-        drop(primary);
-        drop(mirror);
-        fs::remove_dir_all(&parent).unwrap();
-    }
-
-    #[test]
-    fn repairs_a_mirror_left_one_commit_behind() {
-        let parent = temp_dir("repair-behind");
-        fs::create_dir_all(&parent).unwrap();
-        let source = parent.join("source.vlt");
-        let primary_path = parent.join("primary");
-        let mirror_path = parent.join("mirror");
-        let primary = make_ready(&primary_path, &source, b"version one");
-        drop(primary);
-        seed_mirror(&primary_path, &mirror_path).unwrap();
-
-        fs::write(&source, b"version two").unwrap();
-        atomic_copy(&source, &primary_path.join(VAULT_FILE)).unwrap();
-        let primary = Repository::open(&primary_path).unwrap();
-        assert!(commit(&primary, "interrupted checkpoint", 1_700_000_100).unwrap());
-        drop(primary);
-
-        let broken = inspect_pair(&primary_path, &mirror_path, &source.to_string_lossy());
-        assert_eq!(broken.status, "corrupt");
-        let repaired = reconcile_pair(&primary_path, &mirror_path, &source.to_string_lossy()).unwrap();
-        assert_eq!(repaired.status, "ready");
+    fn unchanged_objects_are_reused_between_complete_revisions() {
+        let root = std::env::temp_dir().join(format!("vault-history-objects-{}", now()));
+        let repo = init_repo(&root, "C:\\notes.vlt").unwrap();
+        let first = container(&[b"note one", b"same media"], br#"{"generation":1}"#);
+        write_snapshot(&root, &first, None).unwrap();
+        commit(&repo, "one", 1).unwrap();
+        let first_count = fs::read_dir(root.join("objects")).unwrap().count();
+        let second = container(&[b"note two", b"same media"], br#"{"generation":2}"#);
+        write_snapshot(&root, &second, None).unwrap();
+        commit(&repo, "two", 2).unwrap();
+        let second_count = fs::read_dir(root.join("objects")).unwrap().count();
         assert_eq!(
-            Repository::open(&primary_path).unwrap().refname_to_id("HEAD").unwrap(),
-            Repository::open(&mirror_path).unwrap().refname_to_id("HEAD").unwrap(),
+            second_count - first_count,
+            2,
+            "only the changed note and manifest should be new"
         );
-        fs::remove_dir_all(&parent).unwrap();
-    }
-
-    #[test]
-    fn does_not_overwrite_truly_diverged_histories() {
-        let parent = temp_dir("keep-divergence");
-        fs::create_dir_all(&parent).unwrap();
-        let source = parent.join("source.vlt");
-        let primary_path = parent.join("primary");
-        let mirror_path = parent.join("mirror");
-        let primary = make_ready(&primary_path, &source, b"version one");
-        drop(primary);
-        seed_mirror(&primary_path, &mirror_path).unwrap();
-
-        fs::write(primary_path.join(VAULT_FILE), b"primary edit").unwrap();
-        fs::write(mirror_path.join(VAULT_FILE), b"mirror edit").unwrap();
-        let primary = Repository::open(&primary_path).unwrap();
-        let mirror = Repository::open(&mirror_path).unwrap();
-        assert!(commit(&primary, "primary", 1_700_000_100).unwrap());
-        assert!(commit(&mirror, "mirror", 1_700_000_100).unwrap());
-        let primary_head = primary.refname_to_id("HEAD").unwrap();
-        let mirror_head = mirror.refname_to_id("HEAD").unwrap();
-        drop(primary);
-        drop(mirror);
-
-        let status = reconcile_pair(&primary_path, &mirror_path, &source.to_string_lossy()).unwrap();
-        assert_eq!(status.status, "corrupt");
-        assert_eq!(Repository::open(&primary_path).unwrap().refname_to_id("HEAD").unwrap(), primary_head);
-        assert_eq!(Repository::open(&mirror_path).unwrap().refname_to_id("HEAD").unwrap(), mirror_head);
-        fs::remove_dir_all(&parent).unwrap();
-    }
-
-    #[test]
-    fn preserving_twice_never_reuses_a_directory_name() {
-        let parent = temp_dir("preserve");
-        let target = parent.join("history");
-        fs::create_dir_all(&target).unwrap();
-        fs::write(target.join("first"), b"one").unwrap();
-        preserve_invalid(&target).unwrap();
-        fs::create_dir_all(&target).unwrap();
-        fs::write(target.join("second"), b"two").unwrap();
-        preserve_invalid(&target).unwrap();
-        let preserved = fs::read_dir(&parent).unwrap().count();
-        assert_eq!(preserved, 2);
-        fs::remove_dir_all(&parent).unwrap();
+        let restored = reconstruct(&repo, &repo.head().unwrap().peel_to_commit().unwrap()).unwrap();
+        assert_eq!(restored, second);
+        drop(repo);
+        fs::remove_dir_all(root).unwrap();
     }
 }

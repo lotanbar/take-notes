@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 const AVIF_SPEED: u8 = 8;
-const AVIF_QUALITY: u8 = 45;
+const AVIF_QUALITY: u8 = 35;
 const ENCODER_THREADS: usize = 1;
 const MAX_ENCRYPTED_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DECODED_PIXELS: u64 = 50_000_000;
@@ -68,6 +68,20 @@ fn pending_dir(app: &tauri::AppHandle, vault_key: &str) -> Result<PathBuf, Strin
     fs::create_dir_all(&dir)
         .map_err(|e| format!("creating pending image directory failed: {e}"))?;
     Ok(dir)
+}
+
+fn media_tool(app: &tauri::AppHandle) -> PathBuf {
+    let filename = if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    };
+    app.path()
+        .resource_dir()
+        .ok()
+        .map(|path| path.join("tools").join(filename))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(filename))
 }
 
 fn pending_path(
@@ -239,10 +253,29 @@ fn read_worker_output(path: &Path) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((output[8..].to_vec(), width, height))
 }
 
-fn run_worker(input_path: &Path, output_path: &Path) -> Result<(), String> {
+fn run_worker(input_path: &Path, output_path: &Path, verifier: &Path) -> Result<(), String> {
     let input =
         fs::read(input_path).map_err(|e| format!("reading AVIF worker input failed: {e}"))?;
     let (avif, width, height) = encode_avif(&input)?;
+    fs::write(output_path, &avif).map_err(|e| format!("staging AVIF verification failed: {e}"))?;
+    let mut command = Command::new(verifier);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
+    }
+    let verified = command
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(output_path)
+        .args(["-f", "null", "-"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !verified {
+        return Err("encoded AVIF did not decode successfully".into());
+    }
     write_worker_output(output_path, &avif, width, height)
 }
 
@@ -258,8 +291,15 @@ pub fn run_worker_from_args() -> Option<i32> {
     let Some(output_path) = args.next() else {
         return Some(2);
     };
+    let Some(verifier) = args.next() else {
+        return Some(2);
+    };
     Some(
-        match run_worker(Path::new(&input_path), Path::new(&output_path)) {
+        match run_worker(
+            Path::new(&input_path),
+            Path::new(&output_path),
+            Path::new(&verifier),
+        ) {
             Ok(()) => 0,
             Err(_) => 1,
         },
@@ -282,6 +322,7 @@ fn remove_worker(image_id: &str, expected: &SharedChild) -> bool {
 
 #[tauri::command]
 pub async fn optimize_inline_image(
+    app: tauri::AppHandle,
     data: String,
     image_id: String,
 ) -> Result<OptimizedImage, String> {
@@ -296,6 +337,7 @@ pub async fn optimize_inline_image(
 
         let executable =
             std::env::current_exe().map_err(|e| format!("locating AVIF worker failed: {e}"))?;
+        let verifier = media_tool(&app);
         let child = {
             let mut registry = worker_registry()
                 .lock()
@@ -308,10 +350,19 @@ pub async fn optimize_inline_image(
                 let _ = fs::remove_file(&input_path);
                 return Err("this image is already being optimized".into());
             }
-            let child = Command::new(executable)
+            let mut command = Command::new(executable);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                command.creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW);
+            }
+            let child = command
                 .arg(WORKER_FLAG)
                 .arg(&input_path)
                 .arg(&output_path)
+                .arg(&verifier)
                 .spawn()
                 .map_err(|e| format!("starting AVIF worker failed: {e}"))?;
             let shared = Arc::new(Mutex::new(child));

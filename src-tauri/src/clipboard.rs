@@ -34,7 +34,8 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, Strin
 #[tauri::command]
 pub async fn read_native_clipboard() -> Result<ClipboardContent, String> {
     tauri::async_runtime::spawn_blocking(|| {
-        let mut clipboard = Clipboard::new().map_err(|e| format!("opening clipboard failed: {e}"))?;
+        let mut clipboard =
+            Clipboard::new().map_err(|e| format!("opening clipboard failed: {e}"))?;
         if let Ok(image) = clipboard.get_image() {
             let width = image.width;
             let height = image.height;
@@ -50,7 +51,10 @@ pub async fn read_native_clipboard() -> Result<ClipboardContent, String> {
                 text: None,
             });
         }
-        Ok(ClipboardContent { image: None, text: clipboard.get_text().ok() })
+        Ok(ClipboardContent {
+            image: None,
+            text: clipboard.get_text().ok(),
+        })
     })
     .await
     .map_err(|e| format!("clipboard worker failed: {e}"))?

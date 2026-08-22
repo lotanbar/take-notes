@@ -18,7 +18,17 @@ function layoutKey(vaultPath: string): string {
 
 const SHUTDOWN_KEY = "vault-notes:unfinishedShutdown";
 
-export type ClosePhase = "saving-notes" | "syncing-vault" | "updating-history" | "relocking-notes" | "closing";
+export type ClosePhase = "saving-notes" | "optimizing-media" | "rebuilding-vault" | "verifying-vault" | "syncing-vault" | "updating-history" | "relocking-notes" | "closing";
+
+export interface ShutdownProgress {
+  phase: ClosePhase;
+  item?: string;
+  current?: number;
+  total?: number;
+  beforeBytes?: number;
+  afterBytes?: number;
+  savedBytes?: number;
+}
 
 export interface UnfinishedShutdown {
   vaultPath: string;

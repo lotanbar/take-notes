@@ -1,6 +1,6 @@
 [package]
 name = "vault-notes-app"
-version = "0.4.3"
+version = "0.5.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -32,3 +32,11 @@ fs2 = "0.4"
 arboard = "3.6.1"
 png = "0.17"
 image = { version = "0.25.10", default-features = false, features = ["avif", "jpeg", "png", "rayon", "webp"] }
+flate2 = "1"
+brotli = "8"
+zstd = "0.13"
+xz2 = "0.1"
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
