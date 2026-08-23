@@ -166,7 +166,13 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
   function handleSearchSelectFile(fileId: string) {
     if (!vault) return;
     const node = findNode(vault.tree, fileId);
-    if (node) onOpenFile(node);
+    if (node) {
+      setSelection([fileId]);
+      treeApiRef.current?.openParents(fileId);
+      treeApiRef.current?.select(fileId);
+      treeApiRef.current?.scrollTo(fileId);
+      onOpenFile(node);
+    }
   }
 
   function handleSearchSelectFolder(folderId: string) {

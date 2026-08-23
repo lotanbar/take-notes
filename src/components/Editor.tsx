@@ -12,6 +12,7 @@ import {
   setLinkDecorations,
   setInlineImages,
   getDecorationRanges,
+  subscribeNoteAttachments,
   type NoteModelState,
 } from "../editor/noteModel";
 import { clipboardImageFiles, mountInlineImageView, pasteInlineImages, pasteNativeClipboard } from "../editor/inlineImages";
@@ -208,6 +209,9 @@ export function Editor({ fileId, fileName }: EditorProps) {
     noteStateRef.current = noteState;
     noteState.onEntangledShrink = (shrunkIds, entangledIds) =>
       setPendingBookmarkDeletion({ kind: "shrink", shrunkIds, entangledIds });
+    const stopAttachmentStateWatch = subscribeNoteAttachments(noteState, () => {
+      if (mountedRef.current) setAttachments([...noteState.attachments]);
+    });
 
     registerAttachmentUpdateHandler(fileId, (attachmentId, dataB64, size) => {
       const next = noteState.attachments.map((a) => (a.id === attachmentId ? { ...a, data: dataB64, size } : a));
@@ -469,6 +473,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
       cancelled = true;
       mountedRef.current = false;
       unregisterAttachmentUpdateHandler(fileId);
+      stopAttachmentStateWatch();
       editorDomNode?.removeEventListener("paste", handlePaste, true);
       editorDomNode?.removeEventListener("keydown", handleNativePasteKey, true);
       inlineImageView.dispose();

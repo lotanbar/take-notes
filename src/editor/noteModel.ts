@@ -44,6 +44,7 @@ export interface NoteModelState {
   linkDecoIds: string[];
 
   attachments: Attachment[];
+  attachmentListeners: Set<() => void>;
   inlineImages: InlineImage[];
   inlineImageDecoIds: string[];
   inlineImageListeners: Set<() => void>;
@@ -68,6 +69,24 @@ const states = new Map<string, NoteModelState>();
 
 export function getNoteModelState(fileId: string): NoteModelState | undefined {
   return states.get(fileId);
+}
+
+export function subscribeNoteAttachments(state: NoteModelState, listener: () => void): () => void {
+  state.attachmentListeners.add(listener);
+  return () => state.attachmentListeners.delete(listener);
+}
+
+/** Keep an open editor synchronized with a background attachment rewrite. */
+export function applyOptimizedAttachment(fileId: string, replacement: Attachment, attachmentRevision: number): void {
+  const state = states.get(fileId);
+  if (!state) return;
+  state.attachments = state.attachments.map((item) => item.id === replacement.id ? replacement : item);
+  state.latestContent = {
+    ...state.latestContent,
+    attachments: state.attachments,
+    attachmentRevision: Math.max(state.latestContent.attachmentRevision ?? 0, attachmentRevision),
+  };
+  for (const listener of state.attachmentListeners) listener();
 }
 
 export interface AcquireResult {
@@ -97,6 +116,7 @@ export function acquireNoteModel(fileId: string): AcquireResult {
     linkMeta: [],
     linkDecoIds: [],
     attachments: [],
+    attachmentListeners: new Set(),
     inlineImages: [],
     inlineImageDecoIds: [],
     inlineImageListeners: new Set(),

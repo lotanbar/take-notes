@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useVaultStore } from "../store/vaultStore";
 import type { Attachment, CompressionMetadata } from "../types/vault";
+import { applyOptimizedAttachment } from "../editor/noteModel";
+import { withChangedAttachments } from "./attachmentRevision";
+import { createAttachmentOptimizationSnapshotStore, type AttachmentOptimizationSnapshot } from "./attachmentOptimizationSnapshot";
 
 interface NativeResult { data: string; mimeType: string; codec: string; sourceHash: string; outputHash: string; sourceSize: number; outputSize: number; accepted: boolean }
 interface StillResult { data: string; mimeType: string; size: number }
@@ -9,13 +12,18 @@ const queued = new Map<string, { noteId: string; attachment: Attachment }>();
 const failed = new Map<string, { noteId: string; attachment: Attachment }>();
 let running = false;
 let activeId: string | null = null;
-let version = 0;
 
-export interface AttachmentOptimizationSnapshot { pendingCount: number; failedCount: number; version: number }
 let failedCount = 0;
-function publish() { version += 1; for (const listener of listeners) listener(); }
+const snapshotStore = createAttachmentOptimizationSnapshotStore(() => ({
+  pendingCount: queued.size + failed.size + (activeId ? 1 : 0),
+  failedCount,
+}));
+function publish() {
+  snapshotStore.publish();
+  for (const listener of listeners) listener();
+}
 export function subscribeAttachmentOptimizations(listener: () => void) { listeners.add(listener); return () => listeners.delete(listener); }
-export function getAttachmentOptimizationSnapshot(): AttachmentOptimizationSnapshot { return { pendingCount: queued.size + failed.size + (activeId ? 1 : 0), failedCount, version }; }
+export function getAttachmentOptimizationSnapshot(): AttachmentOptimizationSnapshot { return snapshotStore.getSnapshot(); }
 export function waitForAttachmentOptimizations(): Promise<void> { return new Promise((resolve, reject) => { const check = () => { if (!running && queued.size === 0) { stop(); failedCount ? reject(new Error(`${failedCount} media optimization job(s) failed.`)) : resolve(); } }; const stop = subscribeAttachmentOptimizations(check); check(); }); }
 
 async function hashB64(value: string): Promise<string> { const bytes = Uint8Array.from(atob(value), (c) => c.charCodeAt(0)); return [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map((v) => v.toString(16).padStart(2, "0")).join(""); }
@@ -58,7 +66,15 @@ async function processQueue(): Promise<void> {
         await store.saveNodeContent(job.noteId, { ...content, attachments: content.attachments.map((item) => item.id === id ? { ...item, compressionState: "processing" } : item) });
         const { replacement, metadata } = await optimize({ ...current, data: current.data || job.attachment.data });
         const latest = await store.loadNodeContent(job.noteId);
-        if (latest) await store.saveNodeContent(job.noteId, { ...latest, attachments: latest.attachments.map((item) => item.id === id ? { ...replacement, compression: metadata } : item) });
+        if (latest) {
+          const optimized = { ...replacement, compression: metadata };
+          const finalContent = withChangedAttachments(
+            latest,
+            latest.attachments.map((item) => item.id === id ? optimized : item),
+          );
+          await store.saveNodeContent(job.noteId, finalContent);
+          applyOptimizedAttachment(job.noteId, optimized, finalContent.attachmentRevision ?? 0);
+        }
         failed.delete(id);
       }
     } catch (error) {
