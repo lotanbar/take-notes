@@ -59,3 +59,16 @@ pub async fn read_native_clipboard() -> Result<ClipboardContent, String> {
     .await
     .map_err(|e| format!("clipboard worker failed: {e}"))?
 }
+
+#[tauri::command]
+pub async fn write_native_clipboard(text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut clipboard =
+            Clipboard::new().map_err(|e| format!("opening clipboard failed: {e}"))?;
+        clipboard
+            .set_text(text)
+            .map_err(|e| format!("copying text failed: {e}"))
+    })
+    .await
+    .map_err(|e| format!("clipboard worker failed: {e}"))?
+}

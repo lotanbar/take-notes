@@ -5,6 +5,7 @@ import { useVaultStore } from "../store/vaultStore";
 import { useZoomStore } from "../store/zoomStore";
 import { detectDirection } from "../lib/textDirection";
 import { clipboardImageFiles, mountInlineImageView, pasteInlineImages, pasteNativeClipboard } from "../editor/inlineImages";
+import { copyEditorSelectionToNativeClipboard } from "../editor/nativeClipboard";
 
 const BASE_FONT_SIZE = 12;
 const STICKINESS = monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges;
@@ -115,6 +116,15 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
       });
     };
     editorDomNode?.addEventListener("paste", handlePaste, true);
+    const handleNativeCopyKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "c" || event.altKey) return;
+      if (!("__TAURI_INTERNALS__" in window)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void copyEditorSelectionToNativeClipboard(editor).catch((error) => {
+        useVaultStore.setState({ error: `Clipboard copy failed: ${String(error)}` });
+      });
+    };
     const handleNativePasteKey = (event: KeyboardEvent) => {
       if (!("__TAURI_INTERNALS__" in window)) return;
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "v" || !noteState.loaded) return;
@@ -124,6 +134,7 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
         useVaultStore.setState({ error: `Clipboard paste failed: ${String(error)}` });
       });
     };
+    editorDomNode?.addEventListener("keydown", handleNativeCopyKey, true);
     editorDomNode?.addEventListener("keydown", handleNativePasteKey, true);
     const editorId = editor.getId();
     editor.addAction({
@@ -162,6 +173,7 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
       contentSub.dispose();
       pasteSub.dispose();
       editorDomNode?.removeEventListener("paste", handlePaste, true);
+      editorDomNode?.removeEventListener("keydown", handleNativeCopyKey, true);
       editorDomNode?.removeEventListener("keydown", handleNativePasteKey, true);
       inlineImageView.dispose();
       if (noteState.loaded) flushSaveNow(fileId);

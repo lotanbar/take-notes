@@ -54,6 +54,7 @@ pub fn run() {
             history::history_migrate,
             history::history_maintenance,
             clipboard::read_native_clipboard,
+            clipboard::write_native_clipboard,
             compression::compress_note,
             compression::decompress_note,
             compression::benchmark_note_compression,

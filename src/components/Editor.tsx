@@ -16,6 +16,7 @@ import {
   type NoteModelState,
 } from "../editor/noteModel";
 import { clipboardImageFiles, mountInlineImageView, pasteInlineImages, pasteNativeClipboard } from "../editor/inlineImages";
+import { copyEditorSelectionToNativeClipboard } from "../editor/nativeClipboard";
 import { activateInlineImageOptimizations } from "../editor/inlineImageOptimization";
 import { useVaultStore } from "../store/vaultStore";
 import { useZoomStore } from "../store/zoomStore";
@@ -274,6 +275,15 @@ export function Editor({ fileId, fileName }: EditorProps) {
       });
     };
     editorDomNode?.addEventListener("paste", handlePaste, true);
+    const handleNativeCopyKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "c" || event.altKey) return;
+      if (!("__TAURI_INTERNALS__" in window)) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      void copyEditorSelectionToNativeClipboard(editor).catch((error) => {
+        useVaultStore.setState({ error: `Clipboard copy failed: ${String(error)}` });
+      });
+    };
     const handleNativePasteKey = (event: KeyboardEvent) => {
       if (!("__TAURI_INTERNALS__" in window)) return;
       if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "v" || !noteState.loaded) return;
@@ -283,6 +293,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
         useVaultStore.setState({ error: `Clipboard paste failed: ${String(error)}` });
       });
     };
+    editorDomNode?.addEventListener("keydown", handleNativeCopyKey, true);
     editorDomNode?.addEventListener("keydown", handleNativePasteKey, true);
     // addAction scopes each keybinding to this editor id. addCommand uses
     // Monaco's shared keybinding service and can invoke a different pane.
@@ -475,6 +486,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
       unregisterAttachmentUpdateHandler(fileId);
       stopAttachmentStateWatch();
       editorDomNode?.removeEventListener("paste", handlePaste, true);
+      editorDomNode?.removeEventListener("keydown", handleNativeCopyKey, true);
       editorDomNode?.removeEventListener("keydown", handleNativePasteKey, true);
       inlineImageView.dispose();
       stopThemeWatch();
