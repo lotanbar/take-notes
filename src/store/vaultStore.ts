@@ -41,7 +41,7 @@ import { getDeviceId } from "../lib/deviceId";
 import { convertTiptapDocToPlainText, type LegacyNode } from "../editor/legacyMigration";
 import { preserveNewerAttachments } from "../lib/attachmentRevision";
 import { packNote, restoreSelectedCodec, selectCompressionCodec, unpackNote } from "../lib/noteCompression";
-import { clearJournal, hashJournalNodeId, readJournal, writeJournal } from "../lib/sessionJournal";
+import { clearJournal, hashJournalNodeId, prepareJournalContentForReplay, readJournal, writeJournal } from "../lib/sessionJournal";
 import {
   getLastVaultPath,
   setLastVaultPath,
@@ -274,6 +274,7 @@ interface VaultState {
   vault: VaultFile | null;
   masterKey: CryptoKey | null;
   dirty: boolean;
+  opening: boolean;
   error: string | null;
 
   pending: PendingAction | null;
@@ -383,6 +384,7 @@ async function finalizeVaultOpen(
     vault,
     masterKey,
     dirty: false,
+    opening: true,
     error: null,
     pending: null,
     passwordError: null,
@@ -395,45 +397,49 @@ async function finalizeVaultOpen(
     navForward: [],
   });
   restoreSelectedCodec(vault.salt);
-  const journal = await readJournal(syncPath);
-  if (journal.length) {
-    const nodes = flattenTree(vault.tree);
-    const hashes = new Map<string, string>();
-    for (const node of nodes) hashes.set(await hashJournalNodeId(node.id), node.id);
-    for (const record of journal) {
-      const nodeId = hashes.get(record.nodeHash);
-      if (!nodeId) continue;
-      try {
-        const content = JSON.parse(await decryptFromB64(masterKey, record.ciphertext)) as NodeContent;
-        await useVaultStore.getState().saveNodeContent(nodeId, content);
-      } catch (error) {
-        set({ error: `A crash-recovery journal entry could not be replayed and was preserved: ${String(error)}` });
+  try {
+    const journal = await readJournal(syncPath);
+    if (journal.length) {
+      const nodes = flattenTree(vault.tree);
+      const hashes = new Map<string, string>();
+      for (const node of nodes) hashes.set(await hashJournalNodeId(node.id), node.id);
+      for (const record of journal) {
+        const nodeId = hashes.get(record.nodeHash);
+        if (!nodeId) continue;
+        try {
+          const content = JSON.parse(await decryptFromB64(masterKey, record.ciphertext)) as NodeContent;
+          await useVaultStore.getState().saveNodeContent(nodeId, prepareJournalContentForReplay(content));
+        } catch (error) {
+          set({ error: `A crash-recovery journal entry could not be replayed and was preserved: ${String(error)}` });
+        }
       }
     }
-  }
-  void (async () => {
-    const payloads: string[] = [];
-    for (const node of flattenTree(vault.tree)) {
-      if (node.type !== "file" || (node.locked && !sessionUnlockedIds.has(node.id))) continue;
-      const content = await useVaultStore.getState().loadNodeContent(node.id).catch(() => null);
-      if (content) payloads.push(JSON.stringify({ ...content, attachments: [], inlineImages: [] }));
+    void (async () => {
+      const payloads: string[] = [];
+      for (const node of flattenTree(vault.tree)) {
+        if (node.type !== "file" || (node.locked && !sessionUnlockedIds.has(node.id))) continue;
+        const content = await useVaultStore.getState().loadNodeContent(node.id).catch(() => null);
+        if (content) payloads.push(JSON.stringify({ ...content, attachments: [], inlineImages: [] }));
+      }
+      await selectCompressionCodec(vault.salt, payloads);
+    })().catch((error) => console.error("Note compression benchmark failed:", error));
+    const interrupted = readUnfinishedShutdown();
+    if (interrupted?.vaultPath === syncPath) {
+      try {
+        await checkpointOpenVault(
+          () => useVaultStore.getState(),
+          set,
+          "Resumed interrupted shutdown",
+          true,
+        );
+        clearUnfinishedShutdown();
+        set({ error: `The previous close was interrupted during ${interrupted.phase.replace(/-/g, " ")}; rebuild, verified sync, and recovery history were resumed successfully.` });
+      } catch (e) {
+        set({ error: `The previous close was interrupted during ${interrupted.phase.replace(/-/g, " ")}, and resuming it failed: ${String(e)}` });
+      }
     }
-    await selectCompressionCodec(vault.salt, payloads);
-  })().catch((error) => console.error("Note compression benchmark failed:", error));
-  const interrupted = readUnfinishedShutdown();
-  if (interrupted?.vaultPath === syncPath) {
-    try {
-      await checkpointOpenVault(
-        () => useVaultStore.getState(),
-        set,
-        "Resumed interrupted shutdown",
-        true,
-      );
-      clearUnfinishedShutdown();
-      set({ error: `The previous close was interrupted during ${interrupted.phase.replace(/-/g, " ")}; rebuild, verified sync, and recovery history were resumed successfully.` });
-    } catch (e) {
-      set({ error: `The previous close was interrupted during ${interrupted.phase.replace(/-/g, " ")}, and resuming it failed: ${String(e)}` });
-    }
+  } finally {
+    set({ opening: false });
   }
 }
 
@@ -548,6 +554,7 @@ function clearOpenVault(set: (partial: Partial<VaultState>) => void, error: stri
     syncPath: null,
     masterKey: null,
     dirty: false,
+    opening: false,
     error,
     sessionUnlockedIds: new Set(),
     nodeKeys: new Map(),
@@ -586,6 +593,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   vault: null,
   masterKey: null,
   dirty: false,
+  opening: false,
   error: null,
 
   pending: null,

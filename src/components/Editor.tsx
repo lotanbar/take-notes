@@ -495,7 +495,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
         clearTimeout(rejectTimer.current);
         rejectTimer.current = null;
       }
-      if (noteState.loaded) flushSaveNow(fileId);
+      if (noteState.loaded && noteState.saveTimer) flushSaveNow(fileId);
       noteState.onEntangledShrink = null;
       editor.dispose();
       releaseNoteModel(fileId);

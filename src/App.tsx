@@ -61,6 +61,7 @@ function EmptyWatermark() {
 
 function App() {
   const vault = useVaultStore((s) => s.vault);
+  const opening = useVaultStore((s) => s.opening);
   const error = useVaultStore((s) => s.error);
   const pending = useVaultStore((s) => s.pending);
   const passwordError = useVaultStore((s) => s.passwordError);
@@ -171,8 +172,9 @@ function App() {
   // the filename passed to their editor components.
   function syncPanelsToTree() {
     const api = dockviewApiRef.current;
-    const currentVault = useVaultStore.getState().vault;
-    if (!api || !currentVault) return;
+    const state = useVaultStore.getState();
+    const currentVault = state.vault;
+    if (!api || !currentVault || state.opening) return;
     const nodesById = new Map(flattenTree(currentVault.tree).map((node) => [node.id, node]));
     for (const panel of api.panels) {
       const params = panel.params as NotePanelParams;
@@ -193,7 +195,7 @@ function App() {
   function closeUnavailablePanels() {
     const api = dockviewApiRef.current;
     const state = useVaultStore.getState();
-    if (!api || !state.vault) return;
+    if (!api || !state.vault || state.opening) return;
     for (const panel of [...api.panels]) {
       const params = panel.params as NotePanelParams;
       const node = findNode(state.vault.tree, params.fileId);
@@ -203,8 +205,9 @@ function App() {
 
   function restoreLayoutIfReady() {
     const api = dockviewApiRef.current;
-    const path = useVaultStore.getState().syncPath;
-    if (!api || !path || restoredForPathRef.current === path) return;
+    const state = useVaultStore.getState();
+    const path = state.syncPath;
+    if (!api || !path || state.opening || restoredForPathRef.current === path) return;
     restoredForPathRef.current = path;
     const saved = loadLayout(path);
     if (saved) {
@@ -252,13 +255,13 @@ function App() {
   useEffect(() => {
     restoreLayoutIfReady();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [syncPath]);
+  }, [syncPath, opening]);
 
   useEffect(() => {
-    if (!vault) return;
+    if (!vault || opening) return;
     syncPanelsToTree();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vault?.tree]);
+  }, [vault?.tree, opening]);
 
   // Relocking a note is transactional in the store. Once its key is gone,
   // remove every primary/duplicate view so no stale editor remains visible.
@@ -281,7 +284,7 @@ function App() {
     // activeFileId/activeBookmarkId/sessionUnlockedIds changing — not to
     // every keystroke-driven save re-running it and re-calling setActive().
     const currentVault = useVaultStore.getState().vault;
-    if (!api || !currentVault || !activeFileId) return;
+    if (!api || !currentVault || opening || !activeFileId) return;
     const node = findNode(currentVault.tree, activeFileId);
     if (!node || node.type !== "file") return;
     if (node.locked && !sessionUnlockedIds.has(node.id)) return;
@@ -297,7 +300,7 @@ function App() {
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeFileId, activeBookmarkId, sessionUnlockedIds]);
+  }, [activeFileId, activeBookmarkId, sessionUnlockedIds, opening]);
 
   const didAutoOpen = useRef(false);
   useEffect(() => {
@@ -311,12 +314,12 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!("__TAURI_INTERNALS__" in window)) return;
+    if (!("__TAURI_INTERNALS__" in window) || opening) return;
     void initializeInlineImageOptimizations(vault?.salt ?? null).catch((optimizationError) => {
       console.error("Could not initialize screenshot optimization:", optimizationError);
     });
     void initializeAttachmentOptimizations().catch((optimizationError) => console.error("Could not initialize attachment optimization:", optimizationError));
-  }, [vault?.salt, sessionUnlockedIds]);
+  }, [vault?.salt, sessionUnlockedIds, opening]);
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;

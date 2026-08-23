@@ -176,7 +176,7 @@ export function EditorMirror({ fileId }: EditorMirrorProps) {
       editorDomNode?.removeEventListener("keydown", handleNativeCopyKey, true);
       editorDomNode?.removeEventListener("keydown", handleNativePasteKey, true);
       inlineImageView.dispose();
-      if (noteState.loaded) flushSaveNow(fileId);
+      if (noteState.loaded && noteState.saveTimer) flushSaveNow(fileId);
       editor.dispose();
       releaseNoteModel(fileId);
       editorRef.current = null;
