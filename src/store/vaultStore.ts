@@ -1421,24 +1421,32 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   },
 
   searchVault: async (query) => {
-    const { vault, sessionUnlockedIds, loadNodeContent } = get();
+    const { vault, sessionUnlockedIds, masterKey, nodeKeys, filePath } = get();
     const q = query.trim();
-    if (!vault || !q) return [];
+    if (!vault || !masterKey || !filePath || !q) return [];
+    const searchFilePath = filePath;
+    const searchMasterKey = masterKey;
 
     const allNodes = flattenTree(vault.tree);
     const nameFuse = new Fuse(allNodes, { keys: ["name"], threshold: 0.4 });
     const nameMatchIds = new Set(nameFuse.search(q).map((r) => r.item.id));
 
     const snippetByFileId = new Map<string, string>();
-    for (const node of allNodes) {
-      if (node.type !== "file") continue;
-      const locked = node.locked && !sessionUnlockedIds.has(node.id);
-      if (locked) continue;
-      const result = await loadNodeContent(node.id);
-      if (!result) continue;
-      const snippet = buildSnippet(result.text, q);
-      if (snippet) snippetByFileId.set(node.id, snippet);
+    const searchable = allNodes.filter((node) =>
+      node.type === "file" && (!node.locked || sessionUnlockedIds.has(node.id)),
+    );
+    let nextIndex = 0;
+    async function scanWorker() {
+      while (nextIndex < searchable.length) {
+        const node = searchable[nextIndex++];
+        await (pendingContentSaves.get(node.id) ?? Promise.resolve());
+        const result = await decryptNodeContent(searchFilePath, node, searchMasterKey, nodeKeys).catch(() => null);
+        if (!result) continue;
+        const snippet = buildSnippet(result.text, q);
+        if (snippet) snippetByFileId.set(node.id, snippet);
+      }
     }
+    await Promise.all(Array.from({ length: Math.min(8, searchable.length) }, () => scanWorker()));
 
     const resultIds = new Set([...nameMatchIds, ...snippetByFileId.keys()]);
     const results: SearchResult[] = [];
