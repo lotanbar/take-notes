@@ -22,11 +22,20 @@ import {
 import {
   getInlineImageOptimizationSnapshot,
   initializeInlineImageOptimizations,
+  scanVaultForExistingImages,
   subscribeInlineImageOptimizations,
   waitForInlineImageOptimizations,
   retryInlineImageOptimizations,
 } from "./editor/inlineImageOptimization";
 import { getAttachmentOptimizationSnapshot, initializeAttachmentOptimizations, retryFailedAttachmentOptimizations, subscribeAttachmentOptimizations, waitForAttachmentOptimizations } from "./lib/attachmentOptimization";
+import {
+  continueFullMediaMigration,
+  dismissFullMediaMigration,
+  getCurrentOptimizationCount,
+  getFullMediaMigrationSnapshot,
+  retryFullMediaMigration,
+  subscribeFullMediaMigration,
+} from "./lib/fullMediaMigration";
 import "dockview-react/dist/styles/dockview.css";
 import "./App.css";
 
@@ -100,7 +109,13 @@ function App() {
     getInlineImageOptimizationSnapshot,
   );
   const attachmentOptimizationSnapshot = useSyncExternalStore(subscribeAttachmentOptimizations, getAttachmentOptimizationSnapshot, getAttachmentOptimizationSnapshot);
+  const mediaMigration = useSyncExternalStore(subscribeFullMediaMigration, getFullMediaMigrationSnapshot, getFullMediaMigrationSnapshot);
   const totalPendingOptimizations = optimizationSnapshot.pendingCount + attachmentOptimizationSnapshot.pendingCount;
+
+  useEffect(() => {
+    if (opening || pending || mediaMigration.phase !== "waiting-password") return;
+    void continueFullMediaMigration();
+  }, [opening, pending, sessionUnlockedIds, mediaMigration.phase, mediaMigration.nextLockedNoteId]);
 
   async function finishClose(preserveJournal = false): Promise<void> {
     if (closeProceedingRef.current) return;
@@ -318,6 +333,9 @@ function App() {
     void initializeInlineImageOptimizations(vault?.salt ?? null).catch((optimizationError) => {
       console.error("Could not initialize screenshot optimization:", optimizationError);
     });
+    void scanVaultForExistingImages().catch((optimizationError) => {
+      console.error("Could not resume existing screenshot optimization:", optimizationError);
+    });
     void initializeAttachmentOptimizations().catch((optimizationError) => console.error("Could not initialize attachment optimization:", optimizationError));
   }, [vault?.salt, sessionUnlockedIds, opening]);
 
@@ -416,7 +434,10 @@ function App() {
               {...passwordPromptProps}
               error={passwordError}
               onSubmit={submitPassword}
-              onCancel={cancelPassword}
+              onCancel={() => {
+                if (mediaMigration.phase === "waiting-password") dismissFullMediaMigration();
+                cancelPassword();
+              }}
             />
           )}
           {pending?.kind === "history-init" && (
@@ -484,8 +505,35 @@ function App() {
             {...passwordPromptProps}
             error={passwordError}
             onSubmit={submitPassword}
-            onCancel={cancelPassword}
+            onCancel={() => {
+              if (mediaMigration.phase === "waiting-password") dismissFullMediaMigration();
+              cancelPassword();
+            }}
           />
+        )}
+        {mediaMigration.phase !== "idle" && mediaMigration.phase !== "waiting-password" && (
+          <div className="modal-overlay" role="alertdialog" aria-modal="true" aria-label="Optimizing existing media">
+            <div className="modal">
+              <h2>Optimize Existing Media</h2>
+              <p>
+                {mediaMigration.phase === "scanning" && `Scanning notes ${mediaMigration.scannedNotes}/${mediaMigration.totalNotes}…`}
+                {mediaMigration.phase === "optimizing" && `Optimizing ${getCurrentOptimizationCount()} remaining media item(s)…`}
+                {mediaMigration.phase === "verifying" && `Verifying ${mediaMigration.verifiedMedia}/${mediaMigration.eligibleMedia} media item(s)…`}
+                {mediaMigration.phase === "completed" && `Verified ${mediaMigration.verifiedMedia} media item(s).`}
+                {mediaMigration.phase === "failed" && `Migration failed: ${mediaMigration.error}`}
+              </p>
+              {(mediaMigration.phase === "completed" || mediaMigration.phase === "verifying") && (
+                <p>{`${(mediaMigration.beforeBytes / 1024 / 1024).toFixed(1)} MB → ${(mediaMigration.afterBytes / 1024 / 1024).toFixed(1)} MB; saved ${(mediaMigration.savedBytes / 1024 / 1024).toFixed(1)} MB`}</p>
+              )}
+              <p>{`${mediaMigration.totalAttachments} attachment(s), ${mediaMigration.totalInlineImages} inline image(s), ${mediaMigration.unsupportedAttachments} non-media attachment(s).`}</p>
+              {(mediaMigration.phase === "completed" || mediaMigration.phase === "failed") && (
+                <div className="modal-actions">
+                  {mediaMigration.phase === "failed" && <button type="button" className="primary" onClick={() => void retryFullMediaMigration()}>Retry</button>}
+                  <button type="button" onClick={dismissFullMediaMigration}>Dismiss</button>
+                </div>
+              )}
+            </div>
+          </div>
         )}
         {showOptimizationCloseWarning && (
           <ConfirmDialog

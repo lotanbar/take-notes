@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { findNode, flattenTree } from "../lib/treeOps";
 import { useVaultStore } from "../store/vaultStore";
 import type { InlineImage, NodeContent } from "../types/vault";
+import { MEDIA_COMPRESSION_PROFILE_VERSION } from "../lib/mediaMigrationPolicy";
 import {
   addInlineImage,
   flushSaveNow,
@@ -178,20 +179,21 @@ async function commitReplacement(job: OptimizationJob, replacement: InlineImage)
 
 async function finishJob(job: OptimizationJob, optimized: NativeOptimizedImage): Promise<void> {
   const targetCodec = isAnimatedImage(job.source) ? "av1-webm-720p15" : "avif-q35";
-  const worthwhile = optimized.size + optimized.mimeType.length + targetCodec.length < Math.floor(job.source.size * (1 - MINIMUM_SAVINGS_RATIO)) + job.source.mimeType.length + "original".length;
+  const sourceSize = encodedSize(job.source.data);
+  const worthwhile = optimized.size + optimized.mimeType.length + targetCodec.length < Math.floor(sourceSize * (1 - MINIMUM_SAVINGS_RATIO)) + job.source.mimeType.length + "original".length;
   const data = worthwhile ? optimized.data : job.source.data;
   const codec = worthwhile ? targetCodec : "original";
   const compression = {
     codec: codec as "av1-webm-720p15" | "avif-q35" | "original",
-    profileVersion: 1,
+    profileVersion: MEDIA_COMPRESSION_PROFILE_VERSION,
     sourceHash: await hashB64(job.source.data),
     outputHash: await hashB64(data),
-    sourceSize: job.source.size || encodedSize(job.source.data),
-    outputSize: worthwhile ? optimized.size : (job.source.size || encodedSize(job.source.data)),
+    sourceSize,
+    outputSize: worthwhile ? optimized.size : sourceSize,
   };
   const replacement: InlineImage = worthwhile
     ? { ...job.source, mimeType: optimized.mimeType, size: optimized.size, data, pendingOptimization: false, compressionState: "processed", originalMimeType: job.source.mimeType, compression }
-    : { ...job.source, pendingOptimization: false, compressionState: "processed", originalMimeType: job.source.mimeType, compression };
+    : { ...job.source, size: sourceSize, pendingOptimization: false, compressionState: "processed", originalMimeType: job.source.mimeType, compression };
   const committed = await commitReplacement(job, replacement);
   if (committed && job.recoveryStored) {
     await invoke("pending_image_delete", { vaultKey: job.vaultKey, imageId: job.imageId });
@@ -417,6 +419,13 @@ export async function waitForInlineImageOptimizations(): Promise<void> {
   if (snapshot.pendingCount > 0) {
     throw new Error("Some screenshots could not finish and will resume the next time the vault is opened.");
   }
+}
+
+export function enqueueExistingInlineImage(noteId: string, source: InlineImage): void {
+  const vaultKey = useVaultStore.getState().vault?.salt;
+  if (!vaultKey || !source.pendingOptimization || !source.data) return;
+  resetForVault(vaultKey);
+  enqueue({ vaultKey, noteId, imageId: source.id, source, recoveryStored: false, token: vaultToken, attempts: 0 });
 }
 
 export async function retryInlineImageOptimizations(): Promise<void> {

@@ -9,6 +9,7 @@ import {
   Link,
   PanelLeftOpen,
   PanelLeftClose,
+  Database,
 } from "lucide-react";
 import { TreeView } from "./TreeView";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -19,6 +20,7 @@ import { useUiStore } from "../store/uiStore";
 import { resolveInsertTarget, findNode, collectDescendantIds } from "../lib/treeOps";
 import { findEntangledBookmarks } from "../lib/bookmarkOps";
 import type { TreeNode } from "../types/vault";
+import { startFullMediaMigration } from "../lib/fullMediaMigration";
 
 interface SidebarProps {
   onOpenFile: (node: TreeNode) => void;
@@ -263,6 +265,13 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
           </button>
           <button
             className="icon-btn spacer-left"
+            onClick={() => void startFullMediaMigration()}
+            title="Optimize Existing Media"
+          >
+            <Database size={24} />
+          </button>
+          <button
+            className="icon-btn"
             onClick={() => setConfirmLockVault(true)}
             title="Lock Vault and Return to Main Screen"
           >

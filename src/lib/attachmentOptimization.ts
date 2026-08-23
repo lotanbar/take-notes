@@ -4,6 +4,7 @@ import type { Attachment, CompressionMetadata } from "../types/vault";
 import { applyOptimizedAttachment } from "../editor/noteModel";
 import { withChangedAttachments } from "./attachmentRevision";
 import { createAttachmentOptimizationSnapshotStore, type AttachmentOptimizationSnapshot } from "./attachmentOptimizationSnapshot";
+import { decodedBase64Size, MEDIA_COMPRESSION_PROFILE_VERSION } from "./mediaMigrationPolicy";
 
 interface NativeResult { data: string; mimeType: string; codec: string; sourceHash: string; outputHash: string; sourceSize: number; outputSize: number; accepted: boolean }
 interface StillResult { data: string; mimeType: string; size: number }
@@ -30,6 +31,7 @@ async function hashB64(value: string): Promise<string> { const bytes = Uint8Arra
 function isAnimated(attachment: Attachment): boolean { const mime = attachment.mimeType.toLowerCase(); if (mime === "image/gif" || mime === "image/apng") return true; try { const header = atob(attachment.data.slice(0, 4096)); return mime === "image/png" ? header.includes("acTL") : mime === "image/webp" && (header.includes("ANIM") || header.includes("ANMF")); } catch { return false; } }
 
 export function enqueueAttachmentOptimization(noteId: string, attachment: Attachment): void {
+  if (attachment.mimeType.toLowerCase() === "image/avif") return;
   if (!attachment.compressionState || attachment.compressionState === "processed") return;
   if (queued.has(attachment.id) || failed.has(attachment.id) || activeId === attachment.id) return;
   queued.set(attachment.id, { noteId, attachment }); publish(); if (!running) void processQueue();
@@ -40,16 +42,17 @@ async function optimize(attachment: Attachment): Promise<{ replacement: Attachme
   const mime = attachment.mimeType.toLowerCase();
   if (mime.startsWith("image/") && !isAnimated(attachment)) {
     const result = await invoke<StillResult>("optimize_inline_image", { data: attachment.data, imageId: attachment.id });
-    const accepted = result.size + result.mimeType.length + "avif-q35".length < attachment.size + attachment.mimeType.length + "original".length;
+    const sourceSize = decodedBase64Size(attachment.data);
+    const accepted = result.size + result.mimeType.length + "avif-q35".length < sourceSize + attachment.mimeType.length + "original".length;
     const data = accepted ? result.data : attachment.data;
-    const outputSize = accepted ? result.size : attachment.size;
-    const metadata: CompressionMetadata = { codec: accepted ? "avif-q35" : "original", profileVersion: 1, sourceHash: await hashB64(attachment.data), outputHash: await hashB64(data), sourceSize: attachment.size, outputSize };
+    const outputSize = accepted ? result.size : sourceSize;
+    const metadata: CompressionMetadata = { codec: accepted ? "avif-q35" : "original", profileVersion: MEDIA_COMPRESSION_PROFILE_VERSION, sourceHash: await hashB64(attachment.data), outputHash: await hashB64(data), sourceSize, outputSize };
     return { replacement: { ...attachment, data, blobRef: undefined, size: outputSize, mimeType: accepted ? result.mimeType : attachment.mimeType, compressionState: "processed", originalMimeType: attachment.mimeType }, metadata };
   }
   const mediaMime = mime === "image/png" && isAnimated(attachment) ? "image/apng" : attachment.mimeType;
   const result = await invoke<NativeResult>("optimize_media", { data: attachment.data, mimeType: mediaMime });
   const codec = result.codec === "opus-24k-mono" || result.codec === "av1-webm-720p15" ? result.codec : "original";
-  const metadata: CompressionMetadata = { codec, profileVersion: 1, sourceHash: result.sourceHash, outputHash: result.outputHash, sourceSize: result.sourceSize, outputSize: result.outputSize };
+  const metadata: CompressionMetadata = { codec, profileVersion: MEDIA_COMPRESSION_PROFILE_VERSION, sourceHash: result.sourceHash, outputHash: result.outputHash, sourceSize: result.sourceSize, outputSize: result.outputSize };
   return { replacement: { ...attachment, data: result.data, blobRef: undefined, size: result.outputSize, mimeType: result.mimeType, compressionState: "processed", originalMimeType: attachment.mimeType }, metadata };
 }
 

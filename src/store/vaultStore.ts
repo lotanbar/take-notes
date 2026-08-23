@@ -42,6 +42,7 @@ import { convertTiptapDocToPlainText, type LegacyNode } from "../editor/legacyMi
 import { preserveNewerAttachments } from "../lib/attachmentRevision";
 import { packNote, restoreSelectedCodec, selectCompressionCodec, unpackNote } from "../lib/noteCompression";
 import { clearJournal, hashJournalNodeId, prepareJournalContentForReplay, readJournal, writeJournal } from "../lib/sessionJournal";
+import { resolveAssetBlobRef } from "../lib/assetRefResolution";
 import {
   getLastVaultPath,
   setLastVaultPath,
@@ -132,12 +133,16 @@ async function decryptNodeContent(
   const attachmentRevision = Math.max(parsed?.attachmentRevision ?? 0, node.attachmentRevision ?? 0);
 
   if (parsed && typeof parsed.text === "string") {
+    const resolveAsset = <T extends Attachment | InlineImage>(asset: T): T => ({
+      ...asset,
+      blobRef: resolveAssetBlobRef(asset.blobRef, node.blobRefs),
+    });
     return {
       text: parsed.text,
       bookmarks: parsed.bookmarks ?? [],
       links: parsed.links ?? [],
-      attachments: (parsed.attachments ?? []) as Attachment[],
-      inlineImages: (parsed.inlineImages ?? []) as InlineImage[],
+      attachments: ((parsed.attachments ?? []) as Attachment[]).map(resolveAsset),
+      inlineImages: ((parsed.inlineImages ?? []) as InlineImage[]).map(resolveAsset),
       attachmentRevision,
     };
   }
@@ -1107,11 +1112,9 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     if (parsed && typeof parsed.text === "string") {
       const loadAsset = async <T extends Attachment | InlineImage>(asset: T): Promise<T> => {
         if (!asset.blobRef || asset.data) return asset;
-        const resolvedRef = asset.blobRef.checksum
-          ? node.blobRefs?.find((candidate) => candidate.checksum === asset.blobRef?.checksum) ?? asset.blobRef
-          : asset.blobRef;
+        const resolvedRef = resolveAssetBlobRef(asset.blobRef, node.blobRefs)!;
         const stored = await readVaultBlob(filePath, resolvedRef);
-        return { ...asset, data: await decryptFromB64(masterKey, stored) };
+        return { ...asset, blobRef: resolvedRef, data: await decryptFromB64(masterKey, stored) };
       };
       return {
         text: parsed.text,
@@ -1143,7 +1146,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     if (node.locked && !nodeKey) return;
     await get().journalNodeContent(id, content);
     const persistAsset = async <T extends Attachment | InlineImage>(asset: T): Promise<T> => {
-      if (asset.blobRef) return { ...asset, data: "" };
+      if (asset.blobRef) return { ...asset, data: "", blobRef: resolveAssetBlobRef(asset.blobRef, node.blobRefs) };
       if (!asset.data) return asset;
       // The note-level envelope (and therefore these opaque references) is
       // additionally protected by the note password when locked. Keeping
