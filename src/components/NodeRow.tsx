@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type MouseEvent as ReactMouseEvent } from "react";
 import type { NodeApi, NodeRendererProps } from "react-arborist";
 import { ChevronRight, ChevronDown, Folder, Lock, Unlock, ShieldPlus, ShieldX } from "lucide-react";
 import type { TreeNode } from "../types/vault";
@@ -29,6 +29,7 @@ function EditInput({ node }: { node: NodeApi<TreeNode> }) {
 
 interface NodeRowProps extends NodeRendererProps<TreeNode> {
   interactive?: boolean;
+  onContextMenu?: (node: TreeNode, event: ReactMouseEvent<HTMLDivElement>) => void;
   onRequestAddLock?: (id: string) => void;
   onRequestRemoveLock?: (id: string) => void;
 }
@@ -38,6 +39,7 @@ export function NodeRow({
   style,
   dragHandle,
   interactive = true,
+  onContextMenu,
   onRequestAddLock,
   onRequestRemoveLock,
 }: NodeRowProps) {
@@ -49,7 +51,17 @@ export function NodeRow({
   const disabled = multiSelectActive || !interactive;
 
   return (
-    <div ref={dragHandle} style={style} className={`tree-row${node.isSelected ? " selected" : ""}`}>
+    <div
+      ref={dragHandle}
+      style={style}
+      className={`tree-row${node.isSelected ? " selected" : ""}`}
+      onContextMenu={(event) => {
+        if (!interactive) return;
+        event.preventDefault();
+        event.stopPropagation();
+        onContextMenu?.(data, event);
+      }}
+    >
       {data.type === "folder" ? (
         <span
           className="tree-toggle"

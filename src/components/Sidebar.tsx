@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { createPortal } from "react-dom";
 import type { TreeApi } from "react-arborist";
 import {
   FolderPlus,
@@ -9,7 +10,6 @@ import {
   Link,
   PanelLeftOpen,
   PanelLeftClose,
-  Database,
 } from "lucide-react";
 import { TreeView } from "./TreeView";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -20,7 +20,12 @@ import { useUiStore } from "../store/uiStore";
 import { resolveInsertTarget, findNode, collectDescendantIds } from "../lib/treeOps";
 import { findEntangledBookmarks } from "../lib/bookmarkOps";
 import type { TreeNode } from "../types/vault";
-import { startFullMediaMigration } from "../lib/fullMediaMigration";
+
+interface TreeContextMenuState {
+  nodeId: string;
+  x: number;
+  y: number;
+}
 
 interface SidebarProps {
   onOpenFile: (node: TreeNode) => void;
@@ -46,6 +51,8 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
   const [entangledBookmarkIds, setEntangledBookmarkIds] = useState<string[] | null>(null);
   const [showReferrers, setShowReferrers] = useState(false);
   const [confirmLockVault, setConfirmLockVault] = useState(false);
+  const [contextMenu, setContextMenu] = useState<TreeContextMenuState | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
 
   const sidebarRef = useRef<HTMLDivElement>(null);
   const treeWrapRef = useRef<HTMLDivElement>(null);
@@ -116,7 +123,11 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
 
   useEffect(() => {
     function onDocMouseDown(e: MouseEvent) {
-      if (sidebarRef.current && !sidebarRef.current.contains(e.target as Node)) {
+      if (
+        sidebarRef.current &&
+        !sidebarRef.current.contains(e.target as Node) &&
+        !contextMenuRef.current?.contains(e.target as Node)
+      ) {
         setSelection([]);
         treeApiRef.current?.deselectAll();
       }
@@ -124,6 +135,29 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
     document.addEventListener("mousedown", onDocMouseDown);
     return () => document.removeEventListener("mousedown", onDocMouseDown);
   }, [setSelection]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    function closeMenu(event: MouseEvent) {
+      if (!contextMenuRef.current?.contains(event.target as Node)) setContextMenu(null);
+    }
+    function closeMenuOnKey(event: KeyboardEvent) {
+      if (event.key === "Escape") setContextMenu(null);
+    }
+    const closeMenuUnconditionally = () => setContextMenu(null);
+    document.addEventListener("mousedown", closeMenu);
+    document.addEventListener("scroll", closeMenuUnconditionally, true);
+    window.addEventListener("resize", closeMenuUnconditionally);
+    window.addEventListener("blur", closeMenuUnconditionally);
+    window.addEventListener("keydown", closeMenuOnKey);
+    return () => {
+      document.removeEventListener("mousedown", closeMenu);
+      document.removeEventListener("scroll", closeMenuUnconditionally, true);
+      window.removeEventListener("resize", closeMenuUnconditionally);
+      window.removeEventListener("blur", closeMenuUnconditionally);
+      window.removeEventListener("keydown", closeMenuOnKey);
+    };
+  }, [contextMenu]);
 
   const singleSelected = selectedIds.length === 1 ? selectedIds[0] : null;
   const multiSelectActive = selectedIds.length > 1;
@@ -175,6 +209,18 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
       treeApiRef.current?.scrollTo(fileId);
       onOpenFile(node);
     }
+  }
+
+  function handleContextCreate(type: "folder" | "file") {
+    if (!vault || !contextMenu) return;
+    const { parentId, index } = resolveInsertTarget(vault.tree, [contextMenu.nodeId]);
+    setContextMenu(null);
+    if (parentId) treeApiRef.current?.open(parentId);
+    void treeApiRef.current?.create({
+      type: type === "folder" ? "internal" : "leaf",
+      parentId,
+      index,
+    });
   }
 
   function handleSearchSelectFolder(folderId: string) {
@@ -265,13 +311,6 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
           </button>
           <button
             className="icon-btn spacer-left"
-            onClick={() => void startFullMediaMigration()}
-            title="Optimize Existing Media"
-          >
-            <Database size={24} />
-          </button>
-          <button
-            className="icon-btn"
             onClick={() => setConfirmLockVault(true)}
             title="Lock Vault and Return to Main Screen"
           >
@@ -295,6 +334,17 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
             onSelect={(nodes) => setSelection(nodes.map((n) => n.id))}
             onOpen={(node) => {
               if (node.type === "file") onOpenFile(node);
+            }}
+            onNodeContextMenu={(node, event) => {
+              treeApiRef.current?.select(node.id);
+              setSelection([node.id]);
+              const menuWidth = 168;
+              const menuHeight = 70;
+              setContextMenu({
+                nodeId: node.id,
+                x: Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8)),
+                y: Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8)),
+              });
             }}
             onCreate={({ parentId, index, type }) =>
               createNode(type === "internal" ? "folder" : "file", parentId, index)
@@ -365,6 +415,26 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
           ]}
           onCancel={() => setConfirmLockVault(false)}
         />
+      )}
+      {contextMenu && createPortal(
+        <div
+          ref={contextMenuRef}
+          className="tree-context-menu"
+          role="menu"
+          aria-label="Create in tree"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <button type="button" role="menuitem" onClick={() => handleContextCreate("folder")}>
+            <FolderPlus size={17} />
+            New Folder
+          </button>
+          <button type="button" role="menuitem" onClick={() => handleContextCreate("file")}>
+            <FilePlus size={17} />
+            New File
+          </button>
+        </div>,
+        document.body,
       )}
     </div>
   );

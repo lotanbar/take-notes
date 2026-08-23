@@ -16,6 +16,7 @@ interface TreeViewProps {
   onRename?: (id: string, name: string) => void;
   onMove?: (ids: string[], parentId: string | null, index: number) => void;
   onBlankClick?: () => void;
+  onNodeContextMenu?: (node: TreeNode, event: MouseEvent<HTMLDivElement>) => void;
   onRequestAddLock?: (id: string) => void;
   onRequestRemoveLock?: (id: string) => void;
   treeRef?: Ref<TreeApi<TreeNode> | undefined>;
@@ -31,6 +32,7 @@ export function TreeView({
   onRename,
   onMove,
   onBlankClick,
+  onNodeContextMenu,
   onRequestAddLock,
   onRequestRemoveLock,
   treeRef,
@@ -69,6 +71,7 @@ export function TreeView({
         <NodeRow
           {...rowProps}
           interactive={browse}
+          onContextMenu={onNodeContextMenu}
           onRequestAddLock={onRequestAddLock}
           onRequestRemoveLock={onRequestRemoveLock}
         />
