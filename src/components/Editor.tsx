@@ -82,6 +82,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
   const addReferrerToIndex = useVaultStore((s) => s.addReferrerToIndex);
   const removeReferrerFromIndex = useVaultStore((s) => s.removeReferrerFromIndex);
   const activeBookmarkId = useVaultStore((s) => s.activeBookmarkId);
+  const activeAttachmentId = useVaultStore((s) => s.activeAttachmentId);
   const chromeZoom = useZoomStore((s) => s.chromeZoom);
   const editorZoom = useZoomStore((s) => s.editorZoom);
 
@@ -747,6 +748,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
       )}
       <AttachmentRow
         attachments={attachments}
+        selectedAttachmentId={activeAttachmentId}
         onOpen={handleOpenAttachment}
         onRequestDelete={setPendingDeleteAttachment}
         onSaveAs={handleSaveAttachmentAs}

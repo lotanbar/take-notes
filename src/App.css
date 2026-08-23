@@ -4,6 +4,8 @@
   --border: #d2d2d7;
   --text-0: #000000;
   --text-2: #6b6b74;
+  --accent: #2563eb;
+  --danger: #b42318;
   --scrim-rgb: 20, 20, 22;
   --overlay: rgba(var(--scrim-rgb), 0.45);
   --shadow: rgba(var(--scrim-rgb), 0.12);
@@ -32,6 +34,8 @@
     --border: #4a4a52;
     --text-0: #ffffff;
     --text-2: #9a9aa3;
+    --accent: #60a5fa;
+    --danger: #ff8a80;
     --scrim-rgb: 0, 0, 0;
     --overlay: rgba(var(--scrim-rgb), 0.55);
     --shadow: rgba(var(--scrim-rgb), 0.35);
@@ -620,6 +624,13 @@ body.resizing-sidebar .sidebar-resize-handle {
   background-color: var(--bg-2);
 }
 
+.attachment-chip.selected { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--bg-2); }
+.attachment-chip.pulse { animation: attachment-search-pulse 0.7s ease-in-out infinite alternate; }
+@keyframes attachment-search-pulse {
+  from { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 65%, transparent); }
+  to { box-shadow: 0 0 0 6px transparent; }
+}
+
 .attachment-chip-icon {
   flex-shrink: 0;
   color: var(--text-2);
@@ -798,8 +809,8 @@ body.ctrl-pressed .link-anchor {
 
 .search-input {
   width: 100%;
-  height: 34px;
-  padding: 0 0.7em 0 1.9em;
+  height: 41px;
+  padding: 0 6.7em 0 1.9em;
   font-size: 0.82em;
   background-color: var(--bg-1);
 }
@@ -973,6 +984,17 @@ body.ctrl-pressed .link-anchor {
   background-color: transparent;
   color: var(--text-2);
 }
+
+.search-scope-buttons { position: absolute; right: 4px; display: flex; gap: 2px; }
+.search-scope-btn { display: grid; place-items: center; width: 29px; height: 29px; padding: 0; color: #fff; background: transparent; border: 1px solid transparent; border-radius: 5px; }
+.search-scope-btn.active {
+  color: #fff;
+  background: var(--bg-2);
+  border-color: var(--border);
+}
+.search-scope-btn:hover { background: var(--bg-2); }
+.search-input-wrap .search-scope-btn svg { position: static; color: currentColor; pointer-events: none; }
+.search-error { color: var(--danger); }
 
 .tree-context-menu {
   position: fixed;

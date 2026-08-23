@@ -457,7 +457,10 @@ function App() {
     <div className="zoom-viewport">
       <div
         className="app-shell"
-        onPointerDownCapture={(e) => rememberZoomScope(e.target)}
+        onPointerDownCapture={(e) => {
+          rememberZoomScope(e.target);
+          useVaultStore.getState().clearActiveAttachment();
+        }}
         onFocusCapture={(e) => rememberZoomScope(e.target)}
       >
         <Sidebar onOpenFile={openFile} zoomScale={sidebarZoom} />

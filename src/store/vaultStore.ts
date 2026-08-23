@@ -15,6 +15,7 @@ import {
 } from "../lib/treeOps";
 import { extractBookmarks, getLinkTextsForTargets } from "../lib/bookmarkOps";
 import { buildSnippet } from "../lib/searchOps";
+import type { SearchScopes } from "../lib/searchPreferences";
 import { serializeVault } from "../lib/serializeVault";
 import {
   openVaultFile,
@@ -262,12 +263,22 @@ export interface ReferrerEntry {
   snippets: string[];
 }
 
-export interface SearchResult {
+export type SearchResult = {
+  type: "file" | "folder";
   fileId: string;
   fileName: string;
-  type: NodeType;
-  snippet: string | null;
-}
+} | {
+  type: "content";
+  fileId: string;
+  fileName: string;
+  snippet: string;
+} | {
+  type: "attachment";
+  fileId: string;
+  fileName: string;
+  attachmentId: string;
+  attachmentName: string;
+};
 
 interface VaultState {
   // The local-only working copy this device actually reads/writes — never
@@ -292,6 +303,7 @@ interface VaultState {
 
   activeFileId: string | null;
   activeBookmarkId: string | null;
+  activeAttachmentId: string | null;
   navBack: NavPosition[];
   navForward: NavPosition[];
 
@@ -330,7 +342,8 @@ interface VaultState {
   protectPendingImage: (id: string, plaintext: string) => Promise<string>;
   unprotectPendingImage: (id: string, ciphertext: string) => Promise<string>;
 
-  openFile: (node: TreeNode) => Promise<void>;
+  openFile: (node: TreeNode, targetAttachmentId?: string) => Promise<void>;
+  clearActiveAttachment: () => void;
   navigateToBookmark: (targetBookmarkId: string) => Promise<void>;
   goBack: () => Promise<void>;
   goForward: () => Promise<void>;
@@ -342,7 +355,7 @@ interface VaultState {
   listBookmarksForPicker: () => Promise<PickerEntry[]>;
   getReferrerEntries: (bookmarkIds: string[]) => Promise<ReferrerEntry[]>;
 
-  searchVault: (query: string) => Promise<SearchResult[]>;
+  searchVault: (query: string, scopes: SearchScopes) => Promise<SearchResult[]>;
 }
 
 // Shared by the password-prompt open path and the cached-session fast path:
@@ -398,6 +411,7 @@ async function finalizeVaultOpen(
     selectedIds: [],
     activeFileId: null,
     activeBookmarkId: null,
+    activeAttachmentId: null,
     navBack: [],
     navForward: [],
   });
@@ -566,6 +580,7 @@ function clearOpenVault(set: (partial: Partial<VaultState>) => void, error: stri
     selectedIds: [],
     activeFileId: null,
     activeBookmarkId: null,
+    activeAttachmentId: null,
     navBack: [],
     navForward: [],
     pending: null,
@@ -611,6 +626,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
   activeFileId: null,
   activeBookmarkId: null,
+  activeAttachmentId: null,
   navBack: [],
   navForward: [],
 
@@ -1285,16 +1301,18 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     return decryptFromB64(masterKey, payload);
   },
 
-  openFile: async (node) => {
+  openFile: async (node, targetAttachmentId) => {
     const { sessionUnlockedIds } = get();
     if (node.locked && !sessionUnlockedIds.has(node.id)) {
       await get().toggleNodeLock(node.id, { fileId: node.id, bookmarkId: null });
       return;
     }
     const previous = get().activeFileId;
-    set({ activeFileId: node.id, activeBookmarkId: null });
+    set({ activeFileId: node.id, activeBookmarkId: null, activeAttachmentId: targetAttachmentId ?? null });
     await checkpointAfterNavigation(get, set, previous, node.id);
   },
+
+  clearActiveAttachment: () => set({ activeAttachmentId: null }),
 
   navigateToBookmark: async (targetBookmarkId) => {
     const { vault, activeFileId, activeBookmarkId, sessionUnlockedIds, navBack } = get();
@@ -1311,6 +1329,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     set({
       activeFileId: entry.hostFileId,
       activeBookmarkId: targetBookmarkId,
+      activeAttachmentId: null,
       navBack: nextBack,
       navForward: [],
     });
@@ -1327,6 +1346,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     set({
       activeFileId: prev.fileId,
       activeBookmarkId: prev.bookmarkId,
+      activeAttachmentId: null,
       navBack: navBack.slice(0, -1),
       navForward: nextForward,
     });
@@ -1341,6 +1361,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     set({
       activeFileId: next.fileId,
       activeBookmarkId: next.bookmarkId,
+      activeAttachmentId: null,
       navBack: nextBack,
       navForward: navForward.slice(0, -1),
     });
@@ -1431,7 +1452,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     return entries;
   },
 
-  searchVault: async (query) => {
+  searchVault: async (query, scopes) => {
     const { vault, sessionUnlockedIds, masterKey, nodeKeys, filePath } = get();
     const q = query.trim();
     if (!vault || !masterKey || !filePath || !q) return [];
@@ -1439,32 +1460,43 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const searchMasterKey = masterKey;
 
     const allNodes = flattenTree(vault.tree);
-    const nameFuse = new Fuse(allNodes, { keys: ["name"], threshold: 0.4 });
-    const nameMatchIds = new Set(nameFuse.search(q).map((r) => r.item.id));
+    const nameMatches = scopes.names
+      ? new Fuse(allNodes, { keys: ["name"], threshold: 0.4, includeScore: true }).search(q).map((r) => r.item)
+      : [];
 
     const snippetByFileId = new Map<string, string>();
-    const searchable = allNodes.filter((node) =>
+    const attachmentsByFileId = new Map<string, Array<{ id: string; name: string }>>();
+    const searchable = (scopes.content || scopes.attachments) ? allNodes.filter((node) =>
       node.type === "file" && (!node.locked || sessionUnlockedIds.has(node.id)),
-    );
+    ) : [];
     let nextIndex = 0;
     async function scanWorker() {
       while (nextIndex < searchable.length) {
         const node = searchable[nextIndex++];
         await (pendingContentSaves.get(node.id) ?? Promise.resolve());
-        const result = await decryptNodeContent(searchFilePath, node, searchMasterKey, nodeKeys).catch(() => null);
+        const result = await decryptNodeContent(searchFilePath, node, searchMasterKey, nodeKeys);
         if (!result) continue;
-        const snippet = buildSnippet(result.text, q);
-        if (snippet) snippetByFileId.set(node.id, snippet);
+        if (scopes.content) {
+          const snippet = buildSnippet(result.text, q);
+          if (snippet) snippetByFileId.set(node.id, snippet);
+        }
+        if (scopes.attachments) {
+          const named = result.attachments.filter((attachment) => attachment.name.trim());
+          const matches = new Fuse(named, { keys: ["name"], threshold: 0.4 }).search(q).map(({ item }) => ({ id: item.id, name: item.name }));
+          if (matches.length) attachmentsByFileId.set(node.id, matches);
+        }
       }
     }
     await Promise.all(Array.from({ length: Math.min(8, searchable.length) }, () => scanWorker()));
 
-    const resultIds = new Set([...nameMatchIds, ...snippetByFileId.keys()]);
     const results: SearchResult[] = [];
-    for (const id of resultIds) {
-      const node = allNodes.find((n) => n.id === id);
-      if (!node) continue;
-      results.push({ fileId: id, fileName: node.name, type: node.type, snippet: snippetByFileId.get(id) ?? null });
+    for (const node of nameMatches) results.push({ fileId: node.id, fileName: node.name, type: node.type });
+    for (const node of allNodes) {
+      const snippet = snippetByFileId.get(node.id);
+      if (snippet) results.push({ type: "content", fileId: node.id, fileName: node.name, snippet });
+      for (const attachment of attachmentsByFileId.get(node.id) ?? []) {
+        results.push({ type: "attachment", fileId: node.id, fileName: node.name, attachmentId: attachment.id, attachmentName: attachment.name });
+      }
     }
     return results;
   },
