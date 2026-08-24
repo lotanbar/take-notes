@@ -13,6 +13,9 @@ import {
   setInlineImages,
   getDecorationRanges,
   subscribeNoteAttachments,
+  applyNoteMarkMutation,
+  initializeMarkUndoState,
+  commitMarksAtCurrentUndoState,
   type NoteModelState,
 } from "../editor/noteModel";
 import { clipboardImageFiles, mountInlineImageView, pasteInlineImages, pasteNativeClipboard } from "../editor/inlineImages";
@@ -21,6 +24,7 @@ import { activateInlineImageOptimizations } from "../editor/inlineImageOptimizat
 import { useVaultStore } from "../store/vaultStore";
 import { useZoomStore } from "../store/zoomStore";
 import { isLinkBroken } from "../lib/bookmarkOps";
+import { normalizeLinkTarget } from "../lib/bookmarkOps";
 import { fileToAttachment, MAX_ATTACHMENT_BYTES } from "../lib/attachmentOps";
 import { withChangedAttachments } from "../lib/attachmentRevision";
 import { enqueueAttachmentOptimization } from "../lib/attachmentOptimization";
@@ -31,7 +35,8 @@ import {
   unregisterAttachmentUpdateHandler,
 } from "../lib/attachmentWatch";
 import { detectDirection } from "../lib/textDirection";
-import type { Attachment } from "../types/vault";
+import type { Attachment, LinkTarget } from "../types/vault";
+import { targetId } from "../types/vault";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { NewBookmarkPopup } from "./NewBookmarkPopup";
 import { BookmarkPickerPopup } from "./BookmarkPickerPopup";
@@ -77,12 +82,10 @@ interface ToolbarState {
 
 export function Editor({ fileId, fileName }: EditorProps) {
   const loadNodeContent = useVaultStore((s) => s.loadNodeContent);
-  const addBookmarkToIndex = useVaultStore((s) => s.addBookmarkToIndex);
-  const removeBookmarkFromIndex = useVaultStore((s) => s.removeBookmarkFromIndex);
-  const addReferrerToIndex = useVaultStore((s) => s.addReferrerToIndex);
-  const removeReferrerFromIndex = useVaultStore((s) => s.removeReferrerFromIndex);
   const activeBookmarkId = useVaultStore((s) => s.activeBookmarkId);
   const activeAttachmentId = useVaultStore((s) => s.activeAttachmentId);
+  const activeTextOffset = useVaultStore((s) => s.activeTextOffset);
+  const activeTextLength = useVaultStore((s) => s.activeTextLength);
   const chromeZoom = useZoomStore((s) => s.chromeZoom);
   const editorZoom = useZoomStore((s) => s.editorZoom);
 
@@ -106,6 +109,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isDragOver, setIsDragOver] = useState(false);
   const [pendingDeleteAttachment, setPendingDeleteAttachment] = useState<Attachment | null>(null);
+  const [pendingAttachmentBookmarkRemoval, setPendingAttachmentBookmarkRemoval] = useState<Attachment | null>(null);
   const [rejectedNames, setRejectedNames] = useState<string[]>([]);
 
   function refreshToolbarState() {
@@ -177,11 +181,12 @@ export function Editor({ fileId, fileName }: EditorProps) {
     if (!noteState) return;
     const idx = noteState.bookmarkMeta.findIndex((m) => m.bookmarkId === bookmarkId);
     if (idx === -1) return;
-    const ranges = getDecorationRanges(noteState.model, noteState.bookmarkDecoIds).filter((_, i) => i !== idx);
-    noteState.bookmarkMeta = noteState.bookmarkMeta.filter((_, i) => i !== idx);
-    noteState.prevBookmarkWidths.delete(bookmarkId);
-    setBookmarkDecorations(noteState, ranges.filter((r): r is monaco.Range => !!r));
-    removeBookmarkFromIndex(bookmarkId);
+    applyNoteMarkMutation(noteState, () => {
+      const ranges = getDecorationRanges(noteState.model, noteState.bookmarkDecoIds).filter((_, i) => i !== idx);
+      noteState.bookmarkMeta = noteState.bookmarkMeta.filter((_, i) => i !== idx);
+      noteState.prevBookmarkWidths.delete(bookmarkId);
+      setBookmarkDecorations(noteState, ranges.filter((r): r is monaco.Range => !!r));
+    });
     refreshToolbarState();
   }
 
@@ -190,11 +195,11 @@ export function Editor({ fileId, fileName }: EditorProps) {
     if (!noteState) return;
     const idx = noteState.linkMeta.findIndex((m) => m.linkId === linkId);
     if (idx === -1) return;
-    const meta = noteState.linkMeta[idx];
-    const ranges = getDecorationRanges(noteState.model, noteState.linkDecoIds).filter((_, i) => i !== idx);
-    noteState.linkMeta = noteState.linkMeta.filter((_, i) => i !== idx);
-    setLinkDecorations(noteState, ranges.filter((r): r is monaco.Range => !!r));
-    removeReferrerFromIndex(meta.targetBookmarkId, fileId);
+    applyNoteMarkMutation(noteState, () => {
+      const ranges = getDecorationRanges(noteState.model, noteState.linkDecoIds).filter((_, i) => i !== idx);
+      noteState.linkMeta = noteState.linkMeta.filter((_, i) => i !== idx);
+      setLinkDecorations(noteState, ranges.filter((r): r is monaco.Range => !!r));
+    });
     refreshToolbarState();
   }
 
@@ -213,6 +218,20 @@ export function Editor({ fileId, fileName }: EditorProps) {
       setPendingBookmarkDeletion({ kind: "shrink", shrunkIds, entangledIds });
     const stopAttachmentStateWatch = subscribeNoteAttachments(noteState, () => {
       if (mountedRef.current) setAttachments([...noteState.attachments]);
+    });
+    const stopIndexWatch = useVaultStore.subscribe((state, previous) => {
+      if (!noteState.loaded || state.vault?.index === previous.vault?.index) return;
+      const index = state.vault?.index ?? {};
+      let changed = false;
+      noteState.linkMeta = noteState.linkMeta.map((meta) => {
+        const broken = !index[targetId(meta.target)];
+        if (broken !== meta.broken) changed = true;
+        return broken === meta.broken ? meta : { ...meta, broken };
+      });
+      if (changed) {
+        const ranges = getDecorationRanges(noteState.model, noteState.linkDecoIds).filter((range): range is monaco.Range => !!range);
+        setLinkDecorations(noteState, ranges);
+      }
     });
 
     registerAttachmentUpdateHandler(fileId, (attachmentId, dataB64, size) => {
@@ -367,7 +386,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
           const from = model.getOffsetAt(range.getStartPosition());
           const to = model.getOffsetAt(range.getEndPosition());
           if (offset >= from && offset <= to) {
-            useVaultStore.getState().navigateToBookmark(noteState.linkMeta[i].targetBookmarkId);
+            useVaultStore.getState().navigateToTarget(noteState.linkMeta[i].target);
             return;
           }
         }
@@ -388,6 +407,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
           const attachments = result?.attachments ?? [];
           const inlineImages = result?.inlineImages ?? [];
           noteState.attachments = attachments;
+          noteState.attachmentBookmarks = result?.attachmentBookmarks ?? [];
           setAttachments(attachments);
           setInlineImages(noteState, inlineImages);
           noteState.bookmarkMeta = [];
@@ -400,17 +420,19 @@ export function Editor({ fileId, fileName }: EditorProps) {
             bookmarks: [],
             links: [],
             attachments,
+            attachmentBookmarks: noteState.attachmentBookmarks,
             inlineImages,
             attachmentRevision: result?.attachmentRevision ?? 0,
           };
           noteState.loaded = true;
+          initializeMarkUndoState(noteState);
           activateInlineImageOptimizations(noteState);
           refreshRtlLineDecorations(editor, model);
           refreshToolbarState();
           return;
         }
 
-        const content = result ?? { text: "", bookmarks: [], links: [], attachments: [], inlineImages: [], attachmentRevision: 0 };
+        const content = result ?? { text: "", bookmarks: [], links: [], attachments: [], attachmentBookmarks: [], inlineImages: [], attachmentRevision: 0 };
         model.setValue(content.text);
 
         const index = useVaultStore.getState().vault?.index ?? {};
@@ -421,7 +443,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
         );
         noteState.linkMeta = content.links.map((l) => ({
           linkId: l.linkId,
-          targetBookmarkId: l.targetBookmarkId,
+          target: normalizeLinkTarget(l),
           broken: isLinkBroken(l, index),
         }));
         setLinkDecorations(
@@ -430,11 +452,13 @@ export function Editor({ fileId, fileName }: EditorProps) {
         );
 
         noteState.attachments = content.attachments;
+        noteState.attachmentBookmarks = content.attachmentBookmarks ?? [];
         setAttachments(content.attachments);
         setInlineImages(noteState, content.inlineImages);
         noteState.prevBookmarkWidths = new Map(content.bookmarks.map((b) => [b.bookmarkId, b.to - b.from]));
         noteState.latestContent = content;
         noteState.loaded = true;
+        initializeMarkUndoState(noteState);
         activateInlineImageOptimizations(noteState);
         refreshRtlLineDecorations(editor, model);
 
@@ -443,6 +467,9 @@ export function Editor({ fileId, fileName }: EditorProps) {
         if (target) {
           const pos = model.getPositionAt(target.from);
           editor.revealLineInCenter(pos.lineNumber, monaco.editor.ScrollType.Immediate);
+        } else {
+          const offset = useVaultStore.getState().activeTextOffset;
+          if (offset != null) editor.revealPositionInCenter(model.getPositionAt(offset), monaco.editor.ScrollType.Immediate);
         }
         refreshToolbarState();
       }).catch((e) => {
@@ -486,6 +513,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
       mountedRef.current = false;
       unregisterAttachmentUpdateHandler(fileId);
       stopAttachmentStateWatch();
+      stopIndexWatch();
       editorDomNode?.removeEventListener("paste", handlePaste, true);
       editorDomNode?.removeEventListener("keydown", handleNativeCopyKey, true);
       editorDomNode?.removeEventListener("keydown", handleNativePasteKey, true);
@@ -518,6 +546,15 @@ export function Editor({ fileId, fileName }: EditorProps) {
     if (!range) return;
     editor.revealLineInCenter(range.getStartPosition().lineNumber, monaco.editor.ScrollType.Smooth);
   }, [activeBookmarkId, editorReady]);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    const model = editor?.getModel();
+    if (!editor || !model || !editorReady || activeTextOffset == null) return;
+    const position = model.getPositionAt(activeTextOffset);
+    editor.setSelection(monaco.Range.fromPositions(position, model.getPositionAt(Math.min(model.getValueLength(), activeTextOffset + (activeTextLength ?? 1)))));
+    editor.revealPositionInCenter(position, monaco.editor.ScrollType.Smooth);
+  }, [activeTextOffset, activeTextLength, editorReady]);
 
   useEffect(() => {
     const editor = editorRef.current;
@@ -569,25 +606,27 @@ export function Editor({ fileId, fileName }: EditorProps) {
     const range = getSelectionRange();
     if (!editor || !model || !range || !noteState) return;
     const bookmarkId = crypto.randomUUID();
-    noteState.bookmarkMeta = [...noteState.bookmarkMeta, { bookmarkId, label }];
-    const ranges = [...getDecorationRanges(model, noteState.bookmarkDecoIds).filter((r): r is monaco.Range => !!r), range];
-    setBookmarkDecorations(noteState, ranges);
-    noteState.prevBookmarkWidths.set(bookmarkId, model.getOffsetAt(range.getEndPosition()) - model.getOffsetAt(range.getStartPosition()));
-    addBookmarkToIndex(bookmarkId, fileId);
+    applyNoteMarkMutation(noteState, () => {
+      noteState.bookmarkMeta = [...noteState.bookmarkMeta, { bookmarkId, label }];
+      const ranges = [...getDecorationRanges(model, noteState.bookmarkDecoIds).filter((r): r is monaco.Range => !!r), range];
+      setBookmarkDecorations(noteState, ranges);
+      noteState.prevBookmarkWidths.set(bookmarkId, model.getOffsetAt(range.getEndPosition()) - model.getOffsetAt(range.getStartPosition()));
+    });
     setShowNewBookmarkPopup(false);
     editor.focus();
   }
 
-  function handleCreateLink(targetBookmarkId: string) {
+  function handleCreateLink(target: LinkTarget) {
     const editor = editorRef.current;
     const noteState = noteStateRef.current;
     const range = getSelectionRange();
     if (!editor || !range || !noteState) return;
     const linkId = crypto.randomUUID();
-    noteState.linkMeta = [...noteState.linkMeta, { linkId, targetBookmarkId, broken: false }];
-    const ranges = [...getDecorationRanges(noteState.model, noteState.linkDecoIds).filter((r): r is monaco.Range => !!r), range];
-    setLinkDecorations(noteState, ranges);
-    addReferrerToIndex(targetBookmarkId, fileId);
+    applyNoteMarkMutation(noteState, () => {
+      noteState.linkMeta = [...noteState.linkMeta, { linkId, target, broken: false }];
+      const ranges = [...getDecorationRanges(noteState.model, noteState.linkDecoIds).filter((r): r is monaco.Range => !!r), range];
+      setLinkDecorations(noteState, ranges);
+    });
     setShowLinkPicker(false);
     editor.focus();
   }
@@ -608,12 +647,20 @@ export function Editor({ fileId, fileName }: EditorProps) {
     noteState.skipShrinkCheckOnce = true;
     noteState.model.redo();
     const ranges = getDecorationRanges(model, noteState.bookmarkDecoIds);
+    const zeroIds = new Set<string>();
     for (const id of pendingBookmarkDeletion.entangledIds) {
       const idx = noteState.bookmarkMeta.findIndex((m) => m.bookmarkId === id);
       const r = idx >= 0 ? ranges[idx] : undefined;
       const width = r ? model.getOffsetAt(r.getEndPosition()) - model.getOffsetAt(r.getStartPosition()) : 0;
-      if (width === 0) removeBookmarkFromIndex(id);
+      if (width === 0) zeroIds.add(id);
     }
+    if (zeroIds.size > 0) {
+      const keptRanges = ranges.filter((_, index) => !zeroIds.has(noteState.bookmarkMeta[index]?.bookmarkId)).filter((range): range is monaco.Range => !!range);
+      noteState.bookmarkMeta = noteState.bookmarkMeta.filter((meta) => !zeroIds.has(meta.bookmarkId));
+      for (const id of zeroIds) noteState.prevBookmarkWidths.delete(id);
+      setBookmarkDecorations(noteState, keptRanges);
+    }
+    commitMarksAtCurrentUndoState(noteState);
     setPendingBookmarkDeletion(null);
   }
 
@@ -677,13 +724,42 @@ export function Editor({ fileId, fileName }: EditorProps) {
     });
   }
 
+  function toggleAttachmentBookmark(attachment: Attachment) {
+    const noteState = noteStateRef.current;
+    if (!noteState) return;
+    const bookmarked = noteState.attachmentBookmarks.includes(attachment.id);
+    if (bookmarked && (useVaultStore.getState().vault?.index[attachment.id]?.referrers.length ?? 0) > 0) {
+      setPendingAttachmentBookmarkRemoval(attachment);
+      return;
+    }
+    applyNoteMarkMutation(noteState, () => {
+      noteState.attachmentBookmarks = bookmarked
+        ? noteState.attachmentBookmarks.filter((id) => id !== attachment.id)
+        : [...noteState.attachmentBookmarks, attachment.id];
+      for (const listener of noteState.attachmentListeners) listener();
+    });
+  }
+
+  function confirmAttachmentBookmarkRemoval() {
+    const noteState = noteStateRef.current;
+    const attachment = pendingAttachmentBookmarkRemoval;
+    if (!noteState || !attachment) return;
+    applyNoteMarkMutation(noteState, () => {
+      noteState.attachmentBookmarks = noteState.attachmentBookmarks.filter((id) => id !== attachment.id);
+      for (const listener of noteState.attachmentListeners) listener();
+    });
+    setPendingAttachmentBookmarkRemoval(null);
+  }
+
   function handleConfirmDeleteAttachment() {
     const noteState = noteStateRef.current;
     if (!pendingDeleteAttachment || !noteState) return;
     const next = noteState.attachments.filter((a) => a.id !== pendingDeleteAttachment.id);
     noteState.latestContent = withChangedAttachments(noteState.latestContent, next);
     noteState.attachments = next;
+    noteState.attachmentBookmarks = noteState.attachmentBookmarks.filter((id) => id !== pendingDeleteAttachment.id);
     setAttachments(next);
+    useVaultStore.getState().reconcileNoteIndex(fileId, noteState.bookmarkMeta, next.filter((item) => noteState.attachmentBookmarks.includes(item.id)).map((item) => ({ id: item.id, name: item.name })), noteState.linkMeta.map((item) => item.target));
     flushSaveNow(fileId);
     void stopWatchForAttachment(fileId, pendingDeleteAttachment.id);
     setPendingDeleteAttachment(null);
@@ -752,6 +828,8 @@ export function Editor({ fileId, fileName }: EditorProps) {
         onOpen={handleOpenAttachment}
         onRequestDelete={setPendingDeleteAttachment}
         onSaveAs={handleSaveAttachmentAs}
+        bookmarkedIds={noteStateRef.current?.attachmentBookmarks ?? []}
+        onToggleBookmark={toggleAttachmentBookmark}
       />
 
       <div
@@ -802,7 +880,7 @@ export function Editor({ fileId, fileName }: EditorProps) {
       {pendingDeleteAttachment && (
         <ConfirmDialog
           title="Delete attachment?"
-          message={`Remove "${pendingDeleteAttachment.name}" from this note? This can't be undone.`}
+          message={`${(useVaultStore.getState().vault?.index[pendingDeleteAttachment.id]?.referrers.length ?? 0) > 0 ? "Other notes link to this attachment. Removing it will break those links. " : ""}Remove "${pendingDeleteAttachment.name}" from this note? This can't be undone.`}
           actions={[
             {
               label: "Delete",
@@ -812,6 +890,14 @@ export function Editor({ fileId, fileName }: EditorProps) {
             },
           ]}
           onCancel={() => setPendingDeleteAttachment(null)}
+        />
+      )}
+      {pendingAttachmentBookmarkRemoval && (
+        <ConfirmDialog
+          title="Attachment is linked"
+          message="Other notes link to this attachment bookmark. Removing it will break those links."
+          actions={[{ label: "Remove anyway", icon: <Trash2 size={15} />, onClick: confirmAttachmentBookmarkRemoval, variant: "danger" }]}
+          onCancel={() => setPendingAttachmentBookmarkRemoval(null)}
         />
       )}
     </div>

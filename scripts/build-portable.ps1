@@ -23,7 +23,7 @@ try {
   Copy-Item -LiteralPath (Join-Path $ProjectRoot "src-tauri\tools\ffmpeg.exe") -Destination (Join-Path $PortableRoot "tools\ffmpeg.exe")
   Copy-Item -LiteralPath (Join-Path $ProjectRoot "scripts\FFMPEG-NOTICE.txt") -Destination $PortableRoot
 
-  $Zip = Join-Path $OutputRoot "vault-notes-app-0.5.1-windows-x64-portable.zip"
+  $Zip = Join-Path $OutputRoot "vault-notes-app-0.5.2-windows-x64-portable.zip"
   if (Test-Path -LiteralPath $Zip) { Remove-Item -LiteralPath $Zip -Force }
   Compress-Archive -LiteralPath $PortableRoot -DestinationPath $Zip -CompressionLevel Optimal
   Get-Item -LiteralPath $Zip | Select-Object FullName,Length

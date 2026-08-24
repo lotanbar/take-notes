@@ -155,6 +155,7 @@ export function convertTiptapDocToPlainText(rawDoc: LegacyNode): MigratedContent
     })),
     links: [...state.linkSpans].map(([linkId, s]) => ({
       linkId,
+      target: { kind: "text" as const, bookmarkId: s.targetBookmarkId },
       targetBookmarkId: s.targetBookmarkId,
       from: s.from,
       to: s.to,

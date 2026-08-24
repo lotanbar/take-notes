@@ -13,7 +13,7 @@
 // as long as ANY view of the note is open.
 import { monaco } from "./monacoSetup";
 import { useVaultStore } from "../store/vaultStore";
-import type { Attachment, InlineImage, NodeContent } from "../types/vault";
+import type { Attachment, BookmarkIndex, InlineImage, LinkTarget, NodeContent } from "../types/vault";
 
 const SAVE_DEBOUNCE_MS = 500;
 const STICKINESS = monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges;
@@ -25,7 +25,7 @@ export interface BookmarkMeta {
 
 export interface LinkMeta {
   linkId: string;
-  targetBookmarkId: string;
+  target: LinkTarget;
   broken: boolean;
 }
 
@@ -44,6 +44,7 @@ export interface NoteModelState {
   linkDecoIds: string[];
 
   attachments: Attachment[];
+  attachmentBookmarks: string[];
   attachmentListeners: Set<() => void>;
   inlineImages: InlineImage[];
   inlineImageDecoIds: string[];
@@ -53,6 +54,8 @@ export interface NoteModelState {
   saveTimer: ReturnType<typeof setTimeout> | null;
   prevBookmarkWidths: Map<string, number>;
   skipShrinkCheckOnce: boolean;
+  markSnapshots: Map<number, MarkSnapshot>;
+  restoringMarks: boolean;
 
   // Only ever set by the singleton "full" Editor view (never by a duplicate/
   // mirror view) while it's mounted, so it can show the "other files link
@@ -66,6 +69,91 @@ export interface NoteModelState {
 }
 
 const states = new Map<string, NoteModelState>();
+
+interface OffsetRange { from: number; to: number }
+interface MarkSnapshot {
+  bookmarks: Array<BookmarkMeta & OffsetRange>;
+  links: Array<LinkMeta & OffsetRange>;
+  attachmentBookmarks: string[];
+  hostedEntries: BookmarkIndex;
+}
+
+function captureMarkSnapshot(state: NoteModelState): MarkSnapshot {
+  const model = state.model;
+  const index = useVaultStore.getState().vault?.index ?? {};
+  const hostedIds = new Set([...state.bookmarkMeta.map((item) => item.bookmarkId), ...state.attachmentBookmarks]);
+  return {
+    bookmarks: state.bookmarkMeta.map((meta, i) => {
+      const range = model.getDecorationRange(state.bookmarkDecoIds[i]);
+      return { ...meta, from: range ? model.getOffsetAt(range.getStartPosition()) : 0, to: range ? model.getOffsetAt(range.getEndPosition()) : 0 };
+    }),
+    links: state.linkMeta.map((meta, i) => {
+      const range = model.getDecorationRange(state.linkDecoIds[i]);
+      return { ...meta, from: range ? model.getOffsetAt(range.getStartPosition()) : 0, to: range ? model.getOffsetAt(range.getEndPosition()) : 0 };
+    }),
+    attachmentBookmarks: [...state.attachmentBookmarks],
+    hostedEntries: Object.fromEntries([...hostedIds].flatMap((id) => index[id] ? [[id, { ...index[id], referrers: [...index[id].referrers], referrerCounts: { ...(index[id].referrerCounts ?? {}) } }]] : [])),
+  };
+}
+
+function syncNoteIndex(state: NoteModelState): void {
+  const bookmarked = state.attachments
+    .filter((item) => state.attachmentBookmarks.includes(item.id))
+    .map((item) => ({ id: item.id, name: item.name }));
+  useVaultStore.getState().reconcileNoteIndex(state.fileId, state.bookmarkMeta, bookmarked, state.linkMeta.map((item) => item.target));
+}
+
+function restoreMarkSnapshot(state: NoteModelState, snapshot: MarkSnapshot): void {
+  state.restoringMarks = true;
+  state.bookmarkMeta = snapshot.bookmarks.map(({ from: _from, to: _to, ...meta }) => meta);
+  setBookmarkDecorations(state, snapshot.bookmarks.map((item) => monaco.Range.fromPositions(state.model.getPositionAt(item.from), state.model.getPositionAt(item.to))));
+  state.linkMeta = snapshot.links.map(({ from: _from, to: _to, ...meta }) => meta);
+  setLinkDecorations(state, snapshot.links.map((item) => monaco.Range.fromPositions(state.model.getPositionAt(item.from), state.model.getPositionAt(item.to))));
+  state.attachmentBookmarks = [...snapshot.attachmentBookmarks];
+  state.prevBookmarkWidths = new Map(snapshot.bookmarks.map((item) => [item.bookmarkId, item.to - item.from]));
+  useVaultStore.getState().restoreIndexEntries(snapshot.hostedEntries);
+  syncNoteIndex(state);
+  for (const listener of state.attachmentListeners) listener();
+  state.restoringMarks = false;
+}
+
+/** Seed snapshots after persisted marks have been loaded into a newly-created model. */
+export function initializeMarkUndoState(state: NoteModelState): void {
+  state.markSnapshots.clear();
+  state.markSnapshots.set(state.model.getAlternativeVersionId(), captureMarkSnapshot(state));
+}
+
+/** Commit metadata adjusted as part of the current text undo entry. */
+export function commitMarksAtCurrentUndoState(state: NoteModelState): void {
+  syncNoteIndex(state);
+  state.markSnapshots.set(state.model.getAlternativeVersionId(), captureMarkSnapshot(state));
+  scheduleFlush(state);
+}
+
+/** Add a metadata-only operation to the same resource undo stack as typing. */
+export function applyNoteMarkMutation(state: NoteModelState, mutate: () => void): void {
+  const model = state.model;
+  state.markSnapshots.set(model.getAlternativeVersionId(), captureMarkSnapshot(state));
+  model.pushStackElement();
+  mutate();
+  syncNoteIndex(state);
+  scheduleFlush(state);
+
+  // Monaco only exposes text edit operations publicly. An identity edit gives
+  // this metadata mutation a resource-undo entry without changing note text.
+  const value = model.getValue();
+  if (value.length) {
+    const start = model.getPositionAt(0);
+    const end = model.getPositionAt(1);
+    model.pushEditOperations(null, [{ range: monaco.Range.fromPositions(start, end), text: value.slice(0, 1) }], () => null);
+  } else {
+    const pos = new monaco.Range(1, 1, 1, 1);
+    model.pushEditOperations(null, [{ range: pos, text: "\u2060" }], () => null);
+    model.pushEditOperations(null, [{ range: new monaco.Range(1, 1, 1, 2), text: "" }], () => null);
+  }
+  model.pushStackElement();
+  state.markSnapshots.set(model.getAlternativeVersionId(), captureMarkSnapshot(state));
+}
 
 export function getNoteModelState(fileId: string): NoteModelState | undefined {
   return states.get(fileId);
@@ -116,6 +204,7 @@ export function acquireNoteModel(fileId: string): AcquireResult {
     linkMeta: [],
     linkDecoIds: [],
     attachments: [],
+    attachmentBookmarks: [],
     attachmentListeners: new Set(),
     inlineImages: [],
     inlineImageDecoIds: [],
@@ -124,10 +213,12 @@ export function acquireNoteModel(fileId: string): AcquireResult {
     saveTimer: null,
     prevBookmarkWidths: new Map(),
     skipShrinkCheckOnce: false,
+    markSnapshots: new Map(),
+    restoringMarks: false,
     onEntangledShrink: null,
     contentListener: null as unknown as monaco.IDisposable,
   };
-  state.contentListener = model.onDidChangeContent(() => handleContentChange(state));
+  state.contentListener = model.onDidChangeContent((event) => handleContentChange(state, event));
   states.set(fileId, state);
   return { state, isNew: true };
 }
@@ -292,7 +383,7 @@ function contentForSave(state: NoteModelState): NodeContent {
     const range = model.getDecorationRange(state.linkDecoIds[i]);
     return {
       linkId: meta.linkId,
-      targetBookmarkId: meta.targetBookmarkId,
+      target: meta.target,
       from: range ? model.getOffsetAt(range.getStartPosition()) : 0,
       to: range ? model.getOffsetAt(range.getEndPosition()) : 0,
     };
@@ -302,6 +393,7 @@ function contentForSave(state: NoteModelState): NodeContent {
     bookmarks,
     links,
     attachments: state.attachments,
+    attachmentBookmarks: state.attachmentBookmarks,
     inlineImages: persistentInlineImages(state),
   };
   state.latestContent = content;
@@ -332,7 +424,7 @@ export async function flushAllDirtyNotes(): Promise<void> {
   await Promise.all(work);
 }
 
-function handleContentChange(state: NoteModelState) {
+function handleContentChange(state: NoteModelState, event: monaco.editor.IModelContentChangedEvent) {
   if (!state.loaded) {
     // The user typed/pasted before the async initial load resolved. Flag it
     // so the loader preserves what's in the model instead of stomping it
@@ -342,7 +434,12 @@ function handleContentChange(state: NoteModelState) {
   }
   const model = state.model;
 
-  const nextBookmarks = state.bookmarkMeta.map((meta, i) => {
+  if ((event.isUndoing || event.isRedoing) && !state.restoringMarks) {
+    const snapshot = state.markSnapshots.get(model.getAlternativeVersionId());
+    if (snapshot) restoreMarkSnapshot(state, snapshot);
+  }
+
+  let nextBookmarks = state.bookmarkMeta.map((meta, i) => {
     const range = model.getDecorationRange(state.bookmarkDecoIds[i]);
     return {
       bookmarkId: meta.bookmarkId,
@@ -352,6 +449,7 @@ function handleContentChange(state: NoteModelState) {
     };
   });
 
+  const vanishedIds = new Set<string>();
   if (!state.skipShrinkCheckOnce) {
     const shrunkIds: string[] = [];
     for (const b of nextBookmarks) {
@@ -374,12 +472,21 @@ function handleContentChange(state: NoteModelState) {
       } else {
         for (const id of shrunkIds) {
           const b = nextBookmarks.find((x) => x.bookmarkId === id);
-          if (b && b.to - b.from === 0) useVaultStore.getState().removeBookmarkFromIndex(id);
+          if (b && b.to - b.from === 0) vanishedIds.add(id);
         }
       }
     }
   }
   state.skipShrinkCheckOnce = false;
+  if (vanishedIds.size > 0) {
+    const ranges = getDecorationRanges(model, state.bookmarkDecoIds)
+      .filter((_, index) => !vanishedIds.has(state.bookmarkMeta[index]?.bookmarkId))
+      .filter((range): range is monaco.Range => !!range);
+    state.bookmarkMeta = state.bookmarkMeta.filter((meta) => !vanishedIds.has(meta.bookmarkId));
+    setBookmarkDecorations(state, ranges);
+    nextBookmarks = nextBookmarks.filter((bookmark) => !vanishedIds.has(bookmark.bookmarkId));
+    syncNoteIndex(state);
+  }
   state.prevBookmarkWidths = new Map(nextBookmarks.map((b) => [b.bookmarkId, b.to - b.from]));
 
   state.latestContent = {
@@ -389,7 +496,9 @@ function handleContentChange(state: NoteModelState) {
     // only at save time; ordinary typing must not rescan or rebuild them.
     links: state.latestContent.links,
     attachments: state.attachments,
+    attachmentBookmarks: state.attachmentBookmarks,
     inlineImages: state.latestContent.inlineImages,
   };
+  state.markSnapshots.set(model.getAlternativeVersionId(), captureMarkSnapshot(state));
   scheduleFlush(state);
 }

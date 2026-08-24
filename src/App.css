@@ -613,6 +613,8 @@ body.resizing-sidebar .sidebar-resize-handle {
   align-items: center;
   gap: 6px;
   width: fit-content;
+  min-width: 190px;
+  max-width: min(420px, 100%);
   padding: 4px 6px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -640,11 +642,12 @@ body.resizing-sidebar .sidebar-resize-handle {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  flex: 1;
+  flex: 0 1 auto;
 }
 
 .attachment-chip-name {
   font-size: 12px;
+  max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -708,9 +711,18 @@ body.ctrl-pressed .link-anchor {
 /* Bookmark/link popups */
 
 .picker-modal {
-  width: 420px;
+  width: 546px;
   max-width: 90vw;
 }
+
+/* Higher specificity than the generic .modal width declared below. */
+.modal.link-picker-modal {
+  width: 576px;
+  max-width: 92vw;
+}
+
+.picker-search-wrap { width: 100%; }
+.picker-search-input { width: 100%; padding-right: 7.2em; }
 
 .picker-list {
   max-height: 280px;
@@ -787,6 +799,31 @@ body.ctrl-pressed .link-anchor {
 }
 
 /* Search */
+
+.result-list {
+  font-family: Consolas, "Cascadia Mono", "Courier New", monospace;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.result-list-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.result-list-item:last-child { border-bottom: 0; }
+.result-list-item:hover, .result-list-item.selected { background: var(--bg-2); }
+.result-list-item.disabled { color: var(--text-2); cursor: default; }
+.result-list-icon { flex: 0 0 auto; }
+.result-list-text { min-width: 0; flex: 1; }
+.result-list-name, .result-list-snippet { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-list-name { font-weight: 600; }
+.result-list-snippet { padding-top: 2px; color: var(--text-2); }
+.result-list mark { color: inherit; background: color-mix(in srgb, var(--accent) 35%, transparent); border-radius: 2px; }
+.result-list-empty { padding: 10px 12px; margin: 0; }
 
 .search-bar {
   position: relative;

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Paperclip, Save, Trash2 } from "lucide-react";
+import { Bookmark, Paperclip, Save, Trash2 } from "lucide-react";
 import type { Attachment } from "../types/vault";
 import { formatFileSize } from "../lib/attachmentOps";
 
@@ -8,10 +8,12 @@ interface AttachmentRowProps {
   onOpen: (attachment: Attachment) => void;
   onRequestDelete: (attachment: Attachment) => void;
   onSaveAs: (attachment: Attachment) => void;
+  bookmarkedIds: string[];
+  onToggleBookmark: (attachment: Attachment) => void;
   selectedAttachmentId?: string | null;
 }
 
-export function AttachmentRow({ attachments, onOpen, onRequestDelete, onSaveAs, selectedAttachmentId }: AttachmentRowProps) {
+export function AttachmentRow({ attachments, onOpen, onRequestDelete, onSaveAs, bookmarkedIds, onToggleBookmark, selectedAttachmentId }: AttachmentRowProps) {
   const rowRef = useRef<HTMLDivElement>(null);
   const [pulsingId, setPulsingId] = useState<string | null>(null);
 
@@ -35,6 +37,15 @@ export function AttachmentRow({ attachments, onOpen, onRequestDelete, onSaveAs, 
             <span className="attachment-chip-name">{a.name}</span>
             <span className="attachment-chip-size">{formatFileSize(a.size)}</span>
           </div>
+          <button
+            type="button"
+            className={`icon-btn attachment-chip-action${bookmarkedIds.includes(a.id) ? " active" : ""}`}
+            title={bookmarkedIds.includes(a.id) ? "Remove attachment bookmark" : "Bookmark attachment"}
+            aria-pressed={bookmarkedIds.includes(a.id)}
+            onClick={(e) => { e.stopPropagation(); onToggleBookmark(a); }}
+          >
+            <Bookmark size={20} fill={bookmarkedIds.includes(a.id) ? "currentColor" : "none"} />
+          </button>
           <button
             type="button"
             className="icon-btn attachment-chip-action"

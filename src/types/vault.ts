@@ -42,8 +42,14 @@ export interface TreeNode {
 }
 
 export interface BookmarkIndexEntry {
+  /** Missing on legacy vaults; legacy entries are text bookmarks. */
+  kind?: "file" | "text" | "attachment";
   hostFileId: string;
+  attachmentId?: string;
+  attachmentName?: string;
   referrers: string[];
+  /** Per-note link counts. `referrers` is retained for persisted compatibility/UI. */
+  referrerCounts?: Record<string, number>;
 }
 
 export type BookmarkIndex = Record<string, BookmarkIndexEntry>;
@@ -120,9 +126,22 @@ export interface BookmarkRange {
 
 export interface LinkRange {
   linkId: string;
-  targetBookmarkId: string;
+  target: LinkTarget;
+  /** Pre-union persisted links used this field. It is accepted during migration. */
+  targetBookmarkId?: string;
   from: number;
   to: number;
+}
+
+export type LinkTarget =
+  | { kind: "file"; fileId: string }
+  | { kind: "text"; bookmarkId: string }
+  | { kind: "attachment"; hostFileId: string; attachmentId: string };
+
+export function targetId(target: LinkTarget): string {
+  if (target.kind === "file") return target.fileId;
+  if (target.kind === "text") return target.bookmarkId;
+  return target.attachmentId;
 }
 
 export interface NodeContent {
@@ -130,6 +149,8 @@ export interface NodeContent {
   bookmarks: BookmarkRange[];
   links: LinkRange[];
   attachments: Attachment[];
+  /** IDs of attachments promoted to durable link targets. */
+  attachmentBookmarks?: string[];
   inlineImages: InlineImage[];
   attachmentRevision?: number;
 }

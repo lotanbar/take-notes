@@ -1,4 +1,8 @@
-import type { BookmarkIndex, LinkRange, NodeContent } from "../types/vault";
+import type { BookmarkIndex, LinkRange, LinkTarget, NodeContent } from "../types/vault";
+
+function targetId(target: LinkTarget): string {
+  return target.kind === "file" ? target.fileId : target.kind === "text" ? target.bookmarkId : target.attachmentId;
+}
 
 export interface BookmarkMarkInfo {
   bookmarkId: string;
@@ -10,7 +14,11 @@ export function extractBookmarks(content: NodeContent): BookmarkMarkInfo[] {
 }
 
 export function isLinkBroken(link: LinkRange, index: BookmarkIndex): boolean {
-  return !index[link.targetBookmarkId];
+  return !index[targetId(normalizeLinkTarget(link))];
+}
+
+export function normalizeLinkTarget(link: Pick<LinkRange, "target" | "targetBookmarkId">): LinkTarget {
+  return link.target ?? { kind: "text", bookmarkId: link.targetBookmarkId! };
 }
 
 /** Current width (character length) of each bookmark's range, keyed by bookmarkId. */
@@ -21,7 +29,7 @@ export function bookmarkSpanLengths(content: NodeContent): Map<string, number> {
 /** Text currently covered by each distinct link whose target is in `targetBookmarkIds`. */
 export function getLinkTextsForTargets(content: NodeContent, targetBookmarkIds: Set<string>): string[] {
   return content.links
-    .filter((link) => targetBookmarkIds.has(link.targetBookmarkId))
+    .filter((link) => targetBookmarkIds.has(targetId(normalizeLinkTarget(link))))
     .map((link) => content.text.slice(link.from, link.to));
 }
 

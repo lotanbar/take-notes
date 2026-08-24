@@ -28,7 +28,7 @@ interface TreeContextMenuState {
 }
 
 interface SidebarProps {
-  onOpenFile: (node: TreeNode, targetAttachmentId?: string) => void;
+  onOpenFile: (node: TreeNode, targetAttachmentId?: string, targetTextOffset?: number, targetTextLength?: number) => void;
   zoomScale: number;
 }
 
@@ -199,7 +199,7 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
     treeApiRef.current?.deselectAll();
   }
 
-  function handleSearchSelectFile(fileId: string, attachmentId?: string) {
+  function handleSearchSelectFile(fileId: string, attachmentId?: string, textOffset?: number, textLength?: number) {
     if (!vault) return;
     const node = findNode(vault.tree, fileId);
     if (node) {
@@ -207,7 +207,7 @@ export function Sidebar({ onOpenFile, zoomScale }: SidebarProps) {
       treeApiRef.current?.openParents(fileId);
       treeApiRef.current?.select(fileId);
       treeApiRef.current?.scrollTo(fileId);
-      onOpenFile(node, attachmentId);
+      onOpenFile(node, attachmentId, textOffset, textLength);
     }
   }
 

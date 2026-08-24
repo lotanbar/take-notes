@@ -2,9 +2,10 @@ import { useEffect, useState } from "react";
 import { Search, FileSearch, Paperclip, TextSearch } from "lucide-react";
 import { useVaultStore, type SearchResult } from "../store/vaultStore";
 import { loadSearchScopes, saveSearchScopes, toggleSearchScope, type SearchScopes } from "../lib/searchPreferences";
+import { ResultList, type ResultListItem } from "./ResultList";
 
 interface SearchBarProps {
-  onSelectFile: (fileId: string, attachmentId?: string) => void;
+  onSelectFile: (fileId: string, attachmentId?: string, textOffset?: number, textLength?: number) => void;
   onSelectFolder: (fileId: string) => void;
 }
 
@@ -44,7 +45,7 @@ export function SearchBar({ onSelectFile, onSelectFolder }: SearchBarProps) {
 
   function handleClick(result: SearchResult) {
     if (result.type === "folder") onSelectFolder(result.fileId);
-    else onSelectFile(result.fileId, result.type === "attachment" ? result.attachmentId : undefined);
+    else onSelectFile(result.fileId, result.type === "attachment" ? result.attachmentId : undefined, result.type === "content" ? result.offset : undefined, result.type === "content" ? result.matchLength : undefined);
     setQuery("");
   }
 
@@ -57,6 +58,20 @@ export function SearchBar({ onSelectFile, onSelectFolder }: SearchBarProps) {
   }
 
   const active = query.trim().length > 0;
+  const q = query.trim().toLocaleLowerCase();
+  const items: ResultListItem[] = results.map((r, index) => {
+    const nameStart = r.fileName.toLocaleLowerCase().indexOf(q);
+    return {
+      id: `${r.type}-${r.fileId}-${r.type === "attachment" ? r.attachmentId : index}`,
+      kind: r.type === "content" ? "text" : r.type,
+      fileName: r.fileName,
+      snippet: r.type === "content" ? r.snippet : r.type === "attachment" ? r.attachmentName : null,
+      nameMatchStart: r.type === "file" || r.type === "folder" ? r.matchStart : nameStart,
+      nameMatchLength: r.type === "file" || r.type === "folder" ? r.matchLength : nameStart >= 0 ? query.trim().length : 0,
+      snippetMatchStart: r.type === "content" || r.type === "attachment" ? r.matchStart : undefined,
+      snippetMatchLength: r.type === "content" || r.type === "attachment" ? r.matchLength : undefined,
+    };
+  });
 
   return (
     <div className="search-bar">
@@ -89,22 +104,7 @@ export function SearchBar({ onSelectFile, onSelectFolder }: SearchBarProps) {
             <p className="placeholder-text search-empty" role="status">Searching…</p>
           ) : failure ? (
             <p className="search-empty search-error" role="alert">{failure}</p>
-          ) : results.length === 0 ? (
-            <p className="placeholder-text search-empty">No matches.</p>
-          ) : (
-            results.map((r, index) => (
-              <div key={`${r.type}-${r.fileId}-${r.type === "attachment" ? r.attachmentId : index}`} className="search-result-item" onClick={() => handleClick(r)}>
-                <span className="search-result-icon">
-                  {r.type === "content" ? <TextSearch size={15} /> : r.type === "attachment" ? <Paperclip size={15} /> : <FileSearch size={15} />}
-                </span>
-                <div className="search-result-text">
-                  <div className="search-result-name">{r.type === "attachment" ? r.attachmentName : r.fileName}</div>
-                  {r.type === "content" && <div className="search-result-snippet">“{r.snippet}”</div>}
-                  {r.type === "attachment" && <div className="search-result-snippet">In {r.fileName}</div>}
-                </div>
-              </div>
-            ))
-          )}
+          ) : <ResultList items={items} zoomBase="sidebar" onSelect={(item) => { const index = items.indexOf(item); if (index >= 0) handleClick(results[index]); }} />}
         </div>
       )}
     </div>

@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import Fuse from "fuse.js";
 import { save, open } from "@tauri-apps/plugin-dialog";
-import type { VaultFile, VaultHeaderV4, LegacyVaultFile, TreeNode, NodeType, BookmarkIndex, Attachment, InlineImage, NodeContent } from "../types/vault";
+import type { VaultFile, VaultHeaderV4, LegacyVaultFile, TreeNode, NodeType, BookmarkIndex, Attachment, InlineImage, NodeContent, LinkTarget } from "../types/vault";
+import { targetId } from "../types/vault";
 import { deriveKey, encryptToB64, decryptFromB64, randomSaltB64, exportKeyB64, importKeyB64 } from "../crypto/crypto";
 import {
   insertNode,
@@ -13,8 +14,8 @@ import {
   collectDescendantIds,
   flattenTree,
 } from "../lib/treeOps";
-import { extractBookmarks, getLinkTextsForTargets } from "../lib/bookmarkOps";
-import { buildSnippet } from "../lib/searchOps";
+import { getLinkTextsForTargets, normalizeLinkTarget } from "../lib/bookmarkOps";
+import { buildSnippetMatch } from "../lib/searchOps";
 import type { SearchScopes } from "../lib/searchPreferences";
 import { serializeVault } from "../lib/serializeVault";
 import {
@@ -44,6 +45,7 @@ import { preserveNewerAttachments } from "../lib/attachmentRevision";
 import { packNote, restoreSelectedCodec, selectCompressionCodec, unpackNote } from "../lib/noteCompression";
 import { clearJournal, hashJournalNodeId, prepareJournalContentForReplay, readJournal, writeJournal } from "../lib/sessionJournal";
 import { resolveAssetBlobRef } from "../lib/assetRefResolution";
+import { reconcileNoteIndex as reconcileIndexForNote } from "../lib/linkIndexOps";
 import {
   getLastVaultPath,
   setLastVaultPath,
@@ -141,8 +143,12 @@ async function decryptNodeContent(
     return {
       text: parsed.text,
       bookmarks: parsed.bookmarks ?? [],
-      links: parsed.links ?? [],
+      links: (parsed.links ?? []).map((link: NodeContent["links"][number]) => ({
+        ...link,
+        target: normalizeLinkTarget(link),
+      })),
       attachments: ((parsed.attachments ?? []) as Attachment[]).map(resolveAsset),
+      attachmentBookmarks: parsed.attachmentBookmarks ?? [],
       inlineImages: ((parsed.inlineImages ?? []) as InlineImage[]).map(resolveAsset),
       attachmentRevision,
     };
@@ -248,12 +254,37 @@ export interface NavPosition {
   bookmarkId: string | null;
 }
 
+function normalizeIndex(vault: VaultFile): VaultFile {
+  const index: BookmarkIndex = {};
+  for (const [id, entry] of Object.entries(vault.index ?? {})) {
+    const counts = entry.referrerCounts ?? Object.fromEntries((entry.referrers ?? []).map((fileId) => [fileId, 1]));
+    index[id] = {
+      ...entry,
+      kind: entry.kind ?? "text",
+      referrers: Object.keys(counts).filter((fileId) => counts[fileId] > 0),
+      referrerCounts: counts,
+    };
+  }
+  // Files are durable targets even when they have never been bookmarked.
+  for (const node of flattenTree(vault.tree)) {
+    if (node.type === "file" && !index[node.id]) {
+      index[node.id] = { kind: "file", hostFileId: node.id, referrers: [], referrerCounts: {} };
+    }
+  }
+  return { ...vault, index };
+}
+
 export interface PickerEntry {
-  bookmarkId: string;
+  target: LinkTarget;
+  targetId: string;
+  kind: "file" | "text" | "attachment";
   label: string | null;
   hostFileId: string;
   hostFileName: string;
   locked: boolean;
+  snippet: string | null;
+  matchStart?: number;
+  matchLength?: number;
 }
 
 export interface ReferrerEntry {
@@ -267,17 +298,24 @@ export type SearchResult = {
   type: "file" | "folder";
   fileId: string;
   fileName: string;
+  matchStart: number;
+  matchLength: number;
 } | {
   type: "content";
   fileId: string;
   fileName: string;
   snippet: string;
+  matchStart: number;
+  matchLength: number;
+  offset: number;
 } | {
   type: "attachment";
   fileId: string;
   fileName: string;
   attachmentId: string;
   attachmentName: string;
+  matchStart: number;
+  matchLength: number;
 };
 
 interface VaultState {
@@ -304,6 +342,8 @@ interface VaultState {
   activeFileId: string | null;
   activeBookmarkId: string | null;
   activeAttachmentId: string | null;
+  activeTextOffset: number | null;
+  activeTextLength: number | null;
   navBack: NavPosition[];
   navForward: NavPosition[];
 
@@ -342,16 +382,20 @@ interface VaultState {
   protectPendingImage: (id: string, plaintext: string) => Promise<string>;
   unprotectPendingImage: (id: string, ciphertext: string) => Promise<string>;
 
-  openFile: (node: TreeNode, targetAttachmentId?: string) => Promise<void>;
+  openFile: (node: TreeNode, targetAttachmentId?: string, targetTextOffset?: number, targetTextLength?: number) => Promise<void>;
   clearActiveAttachment: () => void;
   navigateToBookmark: (targetBookmarkId: string) => Promise<void>;
+  navigateToTarget: (target: LinkTarget) => Promise<void>;
   goBack: () => Promise<void>;
   goForward: () => Promise<void>;
 
   addBookmarkToIndex: (bookmarkId: string, hostFileId: string) => void;
+  addAttachmentBookmarkToIndex: (attachmentId: string, hostFileId: string, attachmentName?: string) => void;
   removeBookmarkFromIndex: (bookmarkId: string) => void;
   addReferrerToIndex: (targetBookmarkId: string, referrerFileId: string) => void;
   removeReferrerFromIndex: (targetBookmarkId: string, referrerFileId: string) => void;
+  reconcileNoteIndex: (fileId: string, bookmarks: Array<{ bookmarkId: string }>, attachmentBookmarks: Array<{ id: string; name: string }>, linkTargets: LinkTarget[]) => void;
+  restoreIndexEntries: (entries: BookmarkIndex) => void;
   listBookmarksForPicker: () => Promise<PickerEntry[]>;
   getReferrerEntries: (bookmarkIds: string[]) => Promise<ReferrerEntry[]>;
 
@@ -376,6 +420,7 @@ async function finalizeVaultOpen(
     vault = { ...vault, version: 4 };
     await writeVaultHeader(livePath, await serializeVault(vault, masterKey));
   }
+  vault = normalizeIndex(vault);
 
   // Best-effort safety net: one full copy per open, not per edit, so a corrupt
   // append-in-progress can't lose more than the current session's edits.
@@ -412,6 +457,8 @@ async function finalizeVaultOpen(
     activeFileId: null,
     activeBookmarkId: null,
     activeAttachmentId: null,
+    activeTextOffset: null,
+    activeTextLength: null,
     navBack: [],
     navForward: [],
   });
@@ -581,6 +628,8 @@ function clearOpenVault(set: (partial: Partial<VaultState>) => void, error: stri
     activeFileId: null,
     activeBookmarkId: null,
     activeAttachmentId: null,
+    activeTextOffset: null,
+    activeTextLength: null,
     navBack: [],
     navForward: [],
     pending: null,
@@ -627,6 +676,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   activeFileId: null,
   activeBookmarkId: null,
   activeAttachmentId: null,
+  activeTextOffset: null,
+  activeTextLength: null,
   navBack: [],
   navForward: [],
 
@@ -959,7 +1010,10 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const name = uniqueSiblingName(baseName, parent.children);
     const node = buildNode(type, name);
     const nextTree = insertNode(vault.tree, parentId, index, node);
-    set({ vault: { ...vault, tree: nextTree }, dirty: true });
+    const nextIndex = type === "file"
+      ? { ...vault.index, [node.id]: { kind: "file" as const, hostFileId: node.id, referrers: [], referrerCounts: {} } }
+      : vault.index;
+    set({ vault: { ...vault, tree: nextTree, index: nextIndex }, dirty: true });
     return node;
   },
 
@@ -1301,35 +1355,42 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     return decryptFromB64(masterKey, payload);
   },
 
-  openFile: async (node, targetAttachmentId) => {
+  openFile: async (node, targetAttachmentId, targetTextOffset, targetTextLength) => {
     const { sessionUnlockedIds } = get();
     if (node.locked && !sessionUnlockedIds.has(node.id)) {
       await get().toggleNodeLock(node.id, { fileId: node.id, bookmarkId: null });
       return;
     }
     const previous = get().activeFileId;
-    set({ activeFileId: node.id, activeBookmarkId: null, activeAttachmentId: targetAttachmentId ?? null });
+    set({ activeFileId: node.id, activeBookmarkId: null, activeAttachmentId: targetAttachmentId ?? null, activeTextOffset: targetTextOffset ?? null, activeTextLength: targetTextLength ?? null });
     await checkpointAfterNavigation(get, set, previous, node.id);
   },
 
   clearActiveAttachment: () => set({ activeAttachmentId: null }),
 
   navigateToBookmark: async (targetBookmarkId) => {
+    return get().navigateToTarget({ kind: "text", bookmarkId: targetBookmarkId });
+  },
+
+  navigateToTarget: async (target) => {
     const { vault, activeFileId, activeBookmarkId, sessionUnlockedIds, navBack } = get();
     if (!vault) return;
-    const entry = vault.index[targetBookmarkId];
+    const id = targetId(target);
+    const entry = vault.index[id];
     if (!entry) return;
     const hostNode = findNode(vault.tree, entry.hostFileId);
     if (!hostNode) return;
     if (hostNode.locked && !sessionUnlockedIds.has(hostNode.id)) {
-      await get().toggleNodeLock(hostNode.id, { fileId: hostNode.id, bookmarkId: targetBookmarkId });
+      await get().toggleNodeLock(hostNode.id, { fileId: hostNode.id, bookmarkId: target.kind === "text" ? target.bookmarkId : null });
       return;
     }
     const nextBack = activeFileId ? [...navBack, { fileId: activeFileId, bookmarkId: activeBookmarkId }] : navBack;
     set({
       activeFileId: entry.hostFileId,
-      activeBookmarkId: targetBookmarkId,
-      activeAttachmentId: null,
+      activeBookmarkId: target.kind === "text" ? target.bookmarkId : null,
+      activeAttachmentId: target.kind === "attachment" ? target.attachmentId : null,
+      activeTextOffset: null,
+      activeTextLength: null,
       navBack: nextBack,
       navForward: [],
     });
@@ -1347,6 +1408,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       activeFileId: prev.fileId,
       activeBookmarkId: prev.bookmarkId,
       activeAttachmentId: null,
+      activeTextOffset: null,
+      activeTextLength: null,
       navBack: navBack.slice(0, -1),
       navForward: nextForward,
     });
@@ -1362,6 +1425,8 @@ export const useVaultStore = create<VaultState>((set, get) => ({
       activeFileId: next.fileId,
       activeBookmarkId: next.bookmarkId,
       activeAttachmentId: null,
+      activeTextOffset: null,
+      activeTextLength: null,
       navBack: nextBack,
       navForward: navForward.slice(0, -1),
     });
@@ -1371,7 +1436,18 @@ export const useVaultStore = create<VaultState>((set, get) => ({
   addBookmarkToIndex: (bookmarkId, hostFileId) => {
     const { vault } = get();
     if (!vault) return;
-    const nextIndex = { ...vault.index, [bookmarkId]: { hostFileId, referrers: [] } };
+    const nextIndex = { ...vault.index, [bookmarkId]: { kind: "text" as const, hostFileId, referrers: [], referrerCounts: {} } };
+    set({ vault: { ...vault, index: nextIndex }, dirty: true });
+  },
+
+  addAttachmentBookmarkToIndex: (attachmentId, hostFileId, attachmentName) => {
+    const { vault } = get();
+    if (!vault) return;
+    const existing = vault.index[attachmentId];
+    const nextIndex = {
+      ...vault.index,
+      [attachmentId]: existing ?? { kind: "attachment" as const, hostFileId, attachmentId, attachmentName, referrers: [], referrerCounts: {} },
+    };
     set({ vault: { ...vault, index: nextIndex }, dirty: true });
   },
 
@@ -1387,10 +1463,12 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     const { vault } = get();
     if (!vault) return;
     const entry = vault.index[targetBookmarkId];
-    if (!entry || entry.referrers.includes(referrerFileId)) return;
+    if (!entry) return;
+    const counts = { ...(entry.referrerCounts ?? Object.fromEntries(entry.referrers.map((id) => [id, 1]))) };
+    counts[referrerFileId] = (counts[referrerFileId] ?? 0) + 1;
     const nextIndex = {
       ...vault.index,
-      [targetBookmarkId]: { ...entry, referrers: [...entry.referrers, referrerFileId] },
+      [targetBookmarkId]: { ...entry, referrerCounts: counts, referrers: Object.keys(counts).filter((id) => counts[id] > 0) },
     };
     set({ vault: { ...vault, index: nextIndex }, dirty: true });
   },
@@ -1400,11 +1478,30 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     if (!vault) return;
     const entry = vault.index[targetBookmarkId];
     if (!entry) return;
+    const counts = { ...(entry.referrerCounts ?? Object.fromEntries(entry.referrers.map((id) => [id, 1]))) };
+    const nextCount = (counts[referrerFileId] ?? 0) - 1;
+    if (nextCount > 0) counts[referrerFileId] = nextCount;
+    else delete counts[referrerFileId];
     const nextIndex = {
       ...vault.index,
-      [targetBookmarkId]: { ...entry, referrers: entry.referrers.filter((id) => id !== referrerFileId) },
+      [targetBookmarkId]: { ...entry, referrerCounts: counts, referrers: Object.keys(counts) },
     };
     set({ vault: { ...vault, index: nextIndex }, dirty: true });
+  },
+
+  reconcileNoteIndex: (fileId, bookmarks, attachmentBookmarks, linkTargets) => {
+    const { vault } = get();
+    if (!vault) return;
+    const nextIndex = reconcileIndexForNote(vault.index, fileId, bookmarks, attachmentBookmarks, linkTargets);
+    set({ vault: { ...vault, index: nextIndex }, dirty: true });
+  },
+
+  restoreIndexEntries: (entries) => {
+    const { vault } = get();
+    if (!vault || Object.keys(entries).length === 0) return;
+    const index = { ...vault.index };
+    for (const [id, entry] of Object.entries(entries)) index[id] ??= entry;
+    set({ vault: { ...vault, index }, dirty: true });
   },
 
   listBookmarksForPicker: async () => {
@@ -1412,12 +1509,22 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     if (!vault) return [];
     const contentCache = new Map<string, NodeContent | null>();
     const entries: PickerEntry[] = [];
-    for (const [bookmarkId, entry] of Object.entries(vault.index)) {
+    for (const [id, entry] of Object.entries(vault.index)) {
       const hostNode = findNode(vault.tree, entry.hostFileId);
       if (!hostNode) continue;
+      const kind = entry.kind ?? "text";
       const locked = hostNode.locked && !sessionUnlockedIds.has(hostNode.id);
       if (locked) {
-        entries.push({ bookmarkId, label: null, hostFileId: hostNode.id, hostFileName: hostNode.name, locked: true });
+        const target: LinkTarget = kind === "file"
+          ? { kind: "file", fileId: hostNode.id }
+          : kind === "attachment"
+            ? { kind: "attachment", hostFileId: hostNode.id, attachmentId: entry.attachmentId ?? id }
+            : { kind: "text", bookmarkId: id };
+        entries.push({ target, targetId: id, kind, label: entry.attachmentName ?? null, hostFileId: hostNode.id, hostFileName: hostNode.name, locked: true, snippet: entry.attachmentName ?? null });
+        continue;
+      }
+      if (kind === "file") {
+        entries.push({ target: { kind: "file", fileId: id }, targetId: id, kind, label: null, hostFileId: hostNode.id, hostFileName: hostNode.name, locked: false, snippet: null });
         continue;
       }
       if (!contentCache.has(hostNode.id)) {
@@ -1425,8 +1532,23 @@ export const useVaultStore = create<VaultState>((set, get) => ({
         contentCache.set(hostNode.id, result);
       }
       const content = contentCache.get(hostNode.id);
-      const label = content ? extractBookmarks(content).find((b) => b.bookmarkId === bookmarkId)?.label ?? null : null;
-      entries.push({ bookmarkId, label, hostFileId: hostNode.id, hostFileName: hostNode.name, locked: false });
+      if (!content) continue;
+      if (kind === "attachment") {
+        const attachmentId = entry.attachmentId ?? id;
+        const attachment = content.attachments.find((item) => item.id === attachmentId);
+        if (!attachment || !(content.attachmentBookmarks ?? []).includes(attachmentId)) continue;
+        entries.push({ target: { kind: "attachment", hostFileId: hostNode.id, attachmentId }, targetId: id, kind, label: attachment.name, hostFileId: hostNode.id, hostFileName: hostNode.name, locked: false, snippet: attachment.name, matchStart: 0, matchLength: attachment.name.length });
+        continue;
+      }
+      const bookmark = content.bookmarks.find((item) => item.bookmarkId === id);
+      if (!bookmark) continue;
+      const selectedText = content.text.slice(bookmark.from, bookmark.to);
+      const context = buildSnippetMatch(content.text, selectedText, 40);
+      entries.push({
+        target: { kind: "text", bookmarkId: id }, targetId: id, kind, label: bookmark.label,
+        hostFileId: hostNode.id, hostFileName: hostNode.name, locked: false,
+        snippet: context?.text ?? selectedText, matchStart: context?.matchStart ?? 0, matchLength: context?.matchLength ?? selectedText.length,
+      });
     }
     return entries;
   },
@@ -1461,10 +1583,10 @@ export const useVaultStore = create<VaultState>((set, get) => ({
 
     const allNodes = flattenTree(vault.tree);
     const nameMatches = scopes.names
-      ? new Fuse(allNodes, { keys: ["name"], threshold: 0.4, includeScore: true }).search(q).map((r) => r.item)
+      ? new Fuse(allNodes, { keys: ["name"], threshold: 0.4, includeMatches: true }).search(q).map((r) => ({ node: r.item, range: r.matches?.[0]?.indices[0] }))
       : [];
 
-    const snippetByFileId = new Map<string, string>();
+    const snippetByFileId = new Map<string, NonNullable<ReturnType<typeof buildSnippetMatch>>>();
     const attachmentsByFileId = new Map<string, Array<{ id: string; name: string }>>();
     const searchable = (scopes.content || scopes.attachments) ? allNodes.filter((node) =>
       node.type === "file" && (!node.locked || sessionUnlockedIds.has(node.id)),
@@ -1477,7 +1599,7 @@ export const useVaultStore = create<VaultState>((set, get) => ({
         const result = await decryptNodeContent(searchFilePath, node, searchMasterKey, nodeKeys);
         if (!result) continue;
         if (scopes.content) {
-          const snippet = buildSnippet(result.text, q);
+          const snippet = buildSnippetMatch(result.text, q);
           if (snippet) snippetByFileId.set(node.id, snippet);
         }
         if (scopes.attachments) {
@@ -1490,12 +1612,13 @@ export const useVaultStore = create<VaultState>((set, get) => ({
     await Promise.all(Array.from({ length: Math.min(8, searchable.length) }, () => scanWorker()));
 
     const results: SearchResult[] = [];
-    for (const node of nameMatches) results.push({ fileId: node.id, fileName: node.name, type: node.type });
+    for (const { node, range } of nameMatches) results.push({ fileId: node.id, fileName: node.name, type: node.type, matchStart: range?.[0] ?? 0, matchLength: range ? range[1] - range[0] + 1 : 0 });
     for (const node of allNodes) {
       const snippet = snippetByFileId.get(node.id);
-      if (snippet) results.push({ type: "content", fileId: node.id, fileName: node.name, snippet });
+      if (snippet) results.push({ type: "content", fileId: node.id, fileName: node.name, snippet: snippet.text, matchStart: snippet.matchStart, matchLength: snippet.matchLength, offset: snippet.sourceOffset });
       for (const attachment of attachmentsByFileId.get(node.id) ?? []) {
-        results.push({ type: "attachment", fileId: node.id, fileName: node.name, attachmentId: attachment.id, attachmentName: attachment.name });
+        const matchStart = attachment.name.toLocaleLowerCase().indexOf(q.toLocaleLowerCase());
+        results.push({ type: "attachment", fileId: node.id, fileName: node.name, attachmentId: attachment.id, attachmentName: attachment.name, matchStart: Math.max(0, matchStart), matchLength: matchStart >= 0 ? q.length : 0 });
       }
     }
     return results;
